@@ -128,10 +128,15 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
 
-from benchmarks.delayed_ab.canon import canonical_graph, canonical_result, normalize_key
-from benchmarks.delayed_ab.cases import CASES, RATIO_CASES, SUBSERIES, Case
 from dask.base import is_dask_collection
 from dask.hashing import hashers
+
+# Relative imports: ``benchmarks/`` is a PEP 420 namespace package (no
+# ``__init__.py``), so an absolute ``benchmarks.delayed_ab.*`` import would make
+# mypy see each sibling module under two names when the whole repository is
+# checked. The suite is always started as ``python -m benchmarks.delayed_ab``.
+from .canon import canonical_graph, canonical_result, normalize_key
+from .cases import CASES, RATIO_CASES, SUBSERIES, Case
 
 # ---------------------------------------------------------------------------
 # Every magic number of the protocol, auditable in one place.

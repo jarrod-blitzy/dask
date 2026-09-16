@@ -50,6 +50,7 @@ Notes:
 from __future__ import annotations
 
 import contextlib
+import importlib
 import pickle
 import pprint
 import types
@@ -62,7 +63,6 @@ import pytest
 
 import dask
 import dask.hashing
-from benchmarks.delayed_ab.canon import canonical_graph, canonical_result, normalize_key
 from dask._expr import _ExprSequence
 from dask._task_spec import DataNode, Task, TaskRef
 from dask.base import collections_to_expr
@@ -78,6 +78,15 @@ from dask.highlevelgraph import HighLevelGraph
 from dask.threaded import get as _threaded_get
 from dask.tokenize import TokenizationError
 from dask.utils_test import inc
+
+# The single canonicaliser shared with the A/B harness (``benchmarks/delayed_ab/canon.py``).
+# It is imported dynamically because ``benchmarks/`` is a PEP 420 namespace package
+# (no ``__init__.py``): a static ``from benchmarks.delayed_ab.canon import ...`` makes
+# mypy see ``canon.py`` under two module names when the whole repository is checked.
+_canon = importlib.import_module("benchmarks.delayed_ab.canon")
+canonical_graph = _canon.canonical_graph
+canonical_result = _canon.canonical_result
+normalize_key = _canon.normalize_key
 
 # Configuration pinned for every test *and* for ``write_golden()``, defined once
 # so the capture and the assertions cannot drift:
