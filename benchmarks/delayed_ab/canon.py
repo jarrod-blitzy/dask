@@ -1,22 +1,13 @@
 """Canonical, order-independent serialization of ``dask.delayed`` graphs.
 
-This module holds the *single* definition of the canonical form that the
-``delayed`` A/B refactoring run uses as equivalence evidence. It has exactly two
-consumers and they deliberately share one implementation so that they cannot
-drift apart:
-
-* ``benchmarks/delayed_ab/main.py`` canonicalises every object built by both arms
-  of the A/B suite -- the frozen pre-refactor baseline and the live
-  ``dask.delayed`` -- and refuses to record a single timing until the canonical
-  forms, the generated keys and the computed results all match.
-* ``dask/tests/test_delayed_equivalence.py`` captures a committed golden fixture
-  through these functions on the pre-refactor code and re-asserts that fixture,
-  unmodified, after the refactor.
-
-Because the golden fixture was captured through the functions below, the field
-set, the field names, the sort orders and the key-normalisation rules here are
-**frozen**. Changing any of them silently invalidates the committed evidence, so
-nothing may be added, renamed or reordered.
+This module is the *single* definition of the canonical form the ``delayed`` A/B
+refactoring run uses as equivalence evidence. Its two consumers share it so that
+they cannot drift apart: ``benchmarks/delayed_ab/main.py`` records no timing
+until both arms canonicalise identically, and
+``dask/tests/test_delayed_equivalence.py`` holds a committed golden fixture
+captured through these functions. The field set, the field names, the sort
+orders and the key-normalisation rules are therefore **frozen**: changing any of
+them invalidates the committed evidence.
 
 Canonical form
 --------------
@@ -39,122 +30,78 @@ Canonical form
     Sorted list of ``[layer_name, sorted_dependency_layer_names]``.
 
 Order independence comes from sorting every list except ``layer_order`` and
-``dependency_order``. Those two stay unsorted on purpose: layer insertion order
-is token-relevant. Two ``Delayed`` objects with identical graph content but
+``dependency_order``. Those two stay unsorted because layer insertion order is
+token-relevant: two ``Delayed`` objects with identical graph content but
 different layer insertion order tokenize identically under ``tokenize(d)`` and
 *differently* once the object is reached through pickle (an iterator argument, a
 user object holding a ``Delayed``), because ``tokenize`` hashes the pickled slot
-state. These two fields are the only ones that can catch an insertion-order
-regression. The orders they lock, as built by ``dask.highlevelgraph``, are
-existing-then-new for a single dependency (``_from_collection``) and
-new-then-existing for several dependencies (``from_collections``).
+state. They are the only fields that can catch an insertion-order regression.
+The orders they lock, as built by ``dask.highlevelgraph``, are existing-then-new
+for a single dependency (``_from_collection``) and new-then-existing for several
+(``from_collections``).
+
+Key normalisation and supported key types
+-----------------------------------------
+A ``str`` key whose 36-character suffix is a UUID4 token -- what
+``dask.delayed.tokenize`` returns for an impure expression -- becomes
+``<prefix>-#<n>``, numbered by first appearance in the traversal
+``canonical_graph`` documents. A 32-hex deterministic token, and every other
+key, is kept verbatim, so deterministic keys are compared exactly and only
+inherently random tokens are compared structurally.
+
+The key types *this canonicaliser* encodes are ``str``, ``bytes``, ``int``,
+``float``, ``bool``, ``None`` and tuples of those, recursively, by exact type.
+Dask itself accepts any hashable key; this narrower subset is the one that
+reproduces across processes, which is what the golden fixture and the A/B
+comparison require. A ``bytes`` or ``tuple`` key enters the output as its
+``repr`` -- deterministic, free of object identity and identical in both arms.
+Any other object is refused with ``_UnsupportedKeyError`` rather than
+serialised, because a default ``object.__repr__`` embeds a process-specific
+address. The rule is applied once, in ``_canonical_key``.
 
 Sorting and JSON-serialisability
 --------------------------------
 Graph keys mix ``str``, ``int`` and ``tuple``, so ``sorted()`` on raw values can
 raise ``TypeError``. Every sort in this module therefore uses ``_sort_key``,
 which orders values by their ``repr`` -- deterministic, total and type-tolerant.
-
 Every leaf of the returned dict is a ``str``, ``int``, ``float``, ``bool``,
-``None`` or a list of those, because both consumers serialise the dict to JSON
-(the harness writes it into its artefact on mismatch; the test compares it with a
-golden dict literal). Only the key leaf types dask itself permits are encoded:
-``str``, ``bytes``, ``int``, ``float``, ``bool``, ``None`` and ``tuple``\\ s of
-those, recursively. A ``bytes`` or ``tuple`` key enters the output as its
-``repr``, which is deterministic, carries no object identity and is identical in
-both arms. Any other object is refused with ``_UnsupportedKeyError`` rather than
-serialised, because a default ``object.__repr__`` embeds a process-specific
-address: it would make the golden fixture unreproducible and the A/B comparison
-fail for a reason that is not a behaviour change. That rule is applied once, in
-``_canonical_key``, and an expression that trips it is a halt-and-report signal
-for the operator.
+``None`` or a list of those, because both consumers serialise the dict to JSON:
+the harness writes it into its artefact on mismatch, and the test compares it
+with a golden dict literal.
 
-Halt-and-report signals
------------------------
-``dask.highlevelgraph._get_some_layer_name`` falls back to ``str(id(collection))``
-when a collection exposes no usable ``__dask_layers__()``. ``Delayed`` always
-returns ``(self._layer,)``, so no expression in the run's corpus should ever
-produce an ``id()``-derived layer name. Such a name is not reproducible across
-processes and would poison both the golden fixture and the A/B comparison. This
-module does **not** normalise it away: a purely numeric layer name is left in the
-output verbatim so that the comparison fails loudly, and it is a halt-and-report
-signal for the operator -- it means a graph shape the plan did not anticipate was
-reached. The response is to stop and report, never to special-case it here and
-never to edit a frozen ``dask`` module.
+Halt conditions
+---------------
+Two graph shapes are left in the output exactly as they were found, so that a
+comparison fails loudly instead of being silently repaired. Both are
+halt-and-report signals for the operator: the response is to stop and report,
+never to special-case the shape here and never to edit a frozen ``dask`` module.
 
-A second signal has the same shape and a narrower response. A key or layer name
-whose 32-hex token changes between two otherwise identical builds does not come
-from ``tokenize``: ``dask._expr.HLGExpr.deterministic_token`` and
+* An unsupported key type, reported as ``_UnsupportedKeyError``.
+* A purely numeric layer name. ``dask.highlevelgraph._get_some_layer_name``
+  falls back to ``str(id(collection))`` for a collection that exposes no usable
+  ``__dask_layers__()``; ``Delayed`` always returns ``(self._layer,)``, so no
+  expression in the run's corpus should produce one, and an ``id()``-derived
+  name is not reproducible across processes.
+
+A bare 32-hex token that differs between two builds is a third shape, and one
+this module deliberately does not normalise. It is not a ``tokenize`` digest:
+``dask._expr.HLGExpr.deterministic_token`` and
 ``dask._expr.ProhibitReuse._suffix`` fall back to ``uuid.uuid4().hex``, which is
-32 lowercase hex characters and therefore indistinguishable *by shape* from a
-deterministic md5 digest. Expressions that route a non-``Delayed`` dask
-collection through ``unpack_collections`` pick one up -- their dependency layer
-is named ``finalize-hlgfinalizecompute-<hex>-<hex>`` -- and so does the
-``HLGFinalizeCompute`` expression ``dask.delayed.finalize`` stores. This module
-does not normalise bare hex tokens: it cannot tell a random one from a
-deterministic one, and normalising both would destroy the exact comparison of
-deterministic tokens that the characterisation test exists to assert. A consumer
-that has to compare such an expression identifies the random tokens by
-*observation* -- it builds the expression twice and substitutes only the tokens
-that actually changed, leaving every deterministic token verbatim -- which keeps
-every structural field of the canonical form under assertion. The canonicaliser
-stays honest about what it saw; the consumer supplies the proof of which token
-was random.
+indistinguishable *by shape* from a deterministic md5 digest, so normalising it
+would destroy the exact comparison of deterministic tokens the characterisation
+test exists to assert. A consumer that has to compare such an expression
+identifies the random tokens by *observation* -- it builds the expression twice
+and substitutes only the tokens that actually changed.
 
-Requirement conflict, decided
-----------------------------
-Two requirements of this run meet in the placeholder numbering and cannot both
-be taken literally.
-
-* The canonical traversal names "each node's sorted dependencies" as the last
-  stage of the walk that fixes the numbering.
-* The A/B suite must find the two arms' canonical forms *identical* for every
-  case, including the impure variants, whose keys differ in every token between
-  one build and the next.
-
-Sorting a node's dependencies by their raw keys satisfies the first and breaks
-the second. Measured, with the raw ordering in place: the ``wide_fan_in`` case --
-one call taking 5,000 impure leaves, so one node with 5,000 unnumbered
-``f-<uuid4>`` dependencies -- canonicalises *differently* on two builds of the
-same expression, because the random tokens decide which dependency is numbered
-first and ``layer_order`` then carries the permutation. The suite would report an
-equivalence mismatch between two arms that built identical graphs.
-
-The decision is to sort a node's dependencies by ``_sort_key`` of the
-**normalised** key, breaking ties by the position at which the walk first reached
-the key (``_numbering_key``). Three things make this the narrower deviation: it
-is the same order in which the canonical form sorts the dependency list it
-actually emits; it is identical to raw ``_sort_key`` order for every dependency
-set whose keys are deterministic, which is the regime the exact-key assertions
-care about; and the tie-break is layer insertion order, which both arms are
-required to share anyway. Nothing about the *content* of the canonical form
-changes -- only which random token is called ``#0``.
-
-This is a deviation from the letter of the traversal specification and is
-reported as one, not absorbed: it is stated here, in ``_numbering_key``, and in
-the closing report of the run that made it, so that it can be overruled. The
-alternative -- taking the traversal literally and accepting an A/B suite that
-cannot certify equivalence for an impure fan-in -- was rejected because it would
-leave the performance evidence unprovable.
-
-Notes
------
 The module is stateless. The only mutable state involved is the caller-supplied
 ``table`` memo threaded through ``normalize_key``, which keeps the functions
 usable under the harness's arm activation (where ``sys.modules["dask.delayed"]``
 is swapped between arms).
 """
 
-# The future feature is aliased so that it does not bind a public name either:
-# the compiler recognises a future statement by the feature's name, so
-# postponed evaluation of annotations is enabled exactly as it is by the
-# unaliased form, and the module's non-underscore namespace stays confined to
-# the three functions the contract permits.
+# Aliased so that enabling postponed annotation evaluation binds no public name.
 from __future__ import annotations as _annotations
 
-# Every support import is bound under a leading underscore, and ``__all__``
-# names the three functions the module contract permits, so that the public
-# surface of this module is exactly those three and nothing else.
 import re as _re
 from collections.abc import Mapping as _Mapping
 from collections.abc import Sequence as _Sequence
@@ -185,11 +132,18 @@ _UUID4_TOKEN_LEN: int = 36
 class _UnsupportedKeyError(TypeError):
     """A graph key that cannot be canonicalised reproducibly.
 
-    Raised instead of falling back to ``repr`` for an object outside the key leaf
-    types dask permits. It derives from ``TypeError`` so that it reads as the
-    encoding failure it is, and it is deliberately private: the module contract
-    permits three public names, and no consumer catches this -- it propagates as
-    a halt-and-report signal.
+    Raised instead of falling back to ``repr`` for an object outside the key
+    types this canonicaliser encodes reproducibly -- ``str``, ``bytes``, ``int``,
+    ``float``, ``bool``, ``None`` and tuples of those. It derives from
+    ``TypeError`` so that it reads as the encoding failure it is, and it stays
+    private because the module exports three public names.
+
+    The canonicaliser raises it; a consumer decides what to do with it.
+    ``benchmarks/delayed_ab/main.py`` catches it while extracting a case's
+    equivalence evidence and reports it as an equivalence failure, which ends
+    the run with the mismatch exit status rather than a traceback. Either way it
+    is a halt-and-report signal: an expression reached a key shape the canonical
+    form cannot compare across processes.
     """
 
 
@@ -256,21 +210,25 @@ def canonical_graph(obj: object) -> dict[str, _Any]:
     """Serialise a collection's graph into the canonical, comparable form.
 
     Two objects are equivalent for the purposes of this run exactly when their
-    canonical dicts compare equal. The traversal that fixes the placeholder
-    numbering is frozen: the output key, then the layer names in
-    ``list(graph.layers)`` order, then the nodes of each layer in layer-iteration
-    order, and each node's sorted dependencies immediately after that node. The
-    names in ``graph.dependencies`` are walked last, in mapping order, so that a
-    name no layer holds is still numbered deterministically rather than by set
-    iteration order.
+    canonical dicts compare equal.
 
-    The sort applied to a node's dependencies is ``_numbering_key``, which is
-    ``_sort_key`` order over the normalised key -- the same order in which the
-    emitted dependency list itself is sorted -- with the graph-walk position as
-    tie-break. It coincides with ``sorted(dependencies, key=_sort_key)`` for
-    every dependency set whose keys are deterministic. Where it does not, it is a
-    reported deviation rather than a silent one: see "Requirement conflict,
-    decided" in the module docstring.
+    The traversal that fixes the placeholder numbering is frozen, and it is one
+    walk in four stages: the output key, then every layer name in
+    ``list(graph.layers)`` order, then every node key in layer-iteration order,
+    then each node's dependencies sorted by ``_sort_key`` in that same node
+    order. The names in ``graph.dependencies`` are walked last, in mapping order,
+    so that a name no layer holds is still numbered deterministically rather than
+    by set iteration order.
+
+    Staging the walk this way -- rather than numbering a node's dependencies
+    immediately after the node -- is what keeps the numbering independent of the
+    tokens themselves. A ``delayed`` graph names each layer after the key it
+    holds, so by the fourth stage every dependency has already been numbered by
+    its own layer's position, and the dependency sort decides nothing. Were the
+    dependencies numbered while the nodes were being walked, a node with several
+    impure dependencies sharing one prefix would number them in the order of
+    their random tokens, and two builds of one expression would disagree on
+    ``layer_order``.
 
     Args:
         obj: A ``Delayed`` -- or any dask collection exposing ``key``,
@@ -287,7 +245,7 @@ def canonical_graph(obj: object) -> dict[str, _Any]:
 
     Raises:
         _UnsupportedKeyError: if a key, layer name or dependency name is outside
-            the key leaf types the module can encode reproducibly.
+            the key types this canonicaliser encodes reproducibly.
     """
     # ``Delayed`` is consumed duck-typed here: the collection protocol is accessed
     # dynamically so that the public signature can stay ``object``.
@@ -301,53 +259,58 @@ def canonical_graph(obj: object) -> dict[str, _Any]:
     # its iteration order. The complete mapping is what a legacy tuple task has to
     # be resolved against: ``DelayedAttr`` emits ``{key: (getattr, parent_key,
     # attr)}`` and its parent lives in another layer, so a per-layer mapping would
-    # report no dependency at all. ``walk_position`` records where the walk first
-    # reaches each key, which is the tie-break the dependency ordering uses.
+    # report no dependency at all.
     #
     # Every raw name is checked here, before anything normalises it, sorts it or
-    # puts it in a message: ``_numbering_key`` and ``_sort_key`` reach a key's own
-    # ``repr``, so a key this module cannot encode has to be refused before that
-    # happens rather than after.
+    # puts it in a message: ``_sort_key`` reaches a key's own ``repr``, so a key
+    # this module cannot encode has to be refused before that happens rather than
+    # after.
     raw_layers: list[_Any] = []
     low_level: dict[_Any, _Any] = {}
-    walk_position: dict[_Any, int] = {}
     _require_encodable_key(collection.key)
     for layer_name, layer in layers.items():
         _require_encodable_key(layer_name)
         nodes = dict(layer)
         for node_key in nodes:
             _require_encodable_key(node_key)
-            if node_key not in walk_position:
-                walk_position[node_key] = len(walk_position)
         low_level.update(nodes)
         raw_layers.append((layer_name, type(layer).__name__, nodes))
 
     # Pass 1 -- walk the frozen traversal order to assign placeholders, and
-    # collect the node data so that nothing has to be recomputed in pass 2.
+    # collect the node data so that nothing has to be recomputed in pass 2. The
+    # four stages of the walk are the numbering contract and are kept apart on
+    # purpose; see this function's docstring for what interleaving them costs.
+    #
+    # Stage 1 -- the output key.
     normalize_key(collection.key, table)
-    node_entries: list[_Any] = []
-    for layer_name, layer_type, nodes in raw_layers:
+    # Stage 2 -- every layer name, in ``list(graph.layers)`` order.
+    for layer_name, _, _ in raw_layers:
         normalize_key(layer_name, table)
+    # Stage 3 -- every node key, in layer-iteration order.
+    node_entries: list[_Any] = []
+    dependency_stage: list[set[_Any] | frozenset[_Any]] = []
+    for layer_name, layer_type, nodes in raw_layers:
         entries: list[_Any] = []
         for node_key, node in nodes.items():
             normalize_key(node_key, table)
             kind, node_dependencies = _node_kind_and_dependencies(node, low_level)
             for dependency in node_dependencies:
                 _require_encodable_key(dependency)
-            for dependency in sorted(
-                node_dependencies, key=lambda d: _numbering_key(d, walk_position)
-            ):
-                normalize_key(dependency, table)
             entries.append((node_key, kind, node_dependencies, _node_func_name(node)))
+            dependency_stage.append(node_dependencies)
         node_entries.append((layer_name, layer_type, entries))
+    # Stage 4 -- each node's sorted dependencies, in the node order of stage 3.
+    for node_dependencies in dependency_stage:
+        for dependency in sorted(node_dependencies, key=_sort_key):
+            normalize_key(dependency, table)
+    # The layer dependency mapping last, so that a name no layer holds is still
+    # numbered by this walk rather than by the order the fields are emitted in.
     for layer_name, layer_dependencies in dependencies.items():
         _require_encodable_key(layer_name)
         normalize_key(layer_name, table)
         for dependency in layer_dependencies:
             _require_encodable_key(dependency)
-        for dependency in sorted(
-            layer_dependencies, key=lambda d: _numbering_key(d, walk_position)
-        ):
+        for dependency in sorted(layer_dependencies, key=_sort_key):
             normalize_key(dependency, table)
 
     # Pass 2 -- build the fields. Every ``normalize_key`` call below is a memo hit.
@@ -422,7 +385,15 @@ def canonical_result(objs: _Sequence[object]) -> tuple[_Any, ...]:
 
 
 def _sort_key(value: object) -> str:
-    """Total, type-tolerant sort key: order values by their ``repr``."""
+    """Total, type-tolerant sort key: order values by their ``repr``.
+
+    Args:
+        value: Any value being sorted -- a key, a layer name, or one of the
+            nested lists the canonical form is assembled from.
+
+    Returns:
+        str: ``repr(value)``.
+    """
     return repr(value)
 
 
@@ -500,46 +471,18 @@ def _json_safe(value: object) -> str | int | float | bool | None:
 def _canonical_key(
     key: object, table: dict[str, str]
 ) -> str | int | float | bool | None:
-    """Normalise a key and coerce the result to a JSON-expressible leaf."""
-    return _json_safe(normalize_key(key, table))
-
-
-def _numbering_key(
-    dependency: object, walk_position: dict[object, int]
-) -> tuple[str, int, str]:
-    """Order one node's dependencies for placeholder numbering.
-
-    ``_sort_key`` of the dependency comes first, taken over the key with any
-    UUID4 token masked to ``"<prefix>-#0"`` by a throw-away memo -- that is, over
-    the *normalised* key, which is also what the emitted dependency list is
-    sorted by. For a dependency set whose keys are all deterministic the mask
-    changes nothing, so the order is exactly ``sorted(dependencies,
-    key=_sort_key)``. For keys carrying a UUID4 token the mask collapses the
-    random part and the position at which the graph walk first reached the key
-    breaks the tie -- layer insertion order, then node order, both of which the
-    two arms are required to share.
-
-    This is the deviation recorded under "Requirement conflict, decided" in the
-    module docstring, and the reason for it is measurable rather than stylistic:
-    ordering by the raw key orders same-prefix impure dependencies by their
-    random tokens, so a node with several of them numbers them differently in two
-    builds of the same expression and two identical graphs canonicalise
-    differently.
+    """Normalise a key and coerce the result to a JSON-expressible leaf.
 
     Args:
-        dependency: The dependency key being ordered.
-        walk_position: Key to the index at which the graph walk first reached it.
+        key: A graph key, layer name or dependency name.
+        table: The object's first-appearance memo, as threaded by
+            ``canonical_graph``.
 
     Returns:
-        tuple: A total, type-tolerant sort key. A dangling dependency -- a
-        reference to a key no layer holds, which ``delayed`` never produces --
-        sorts after every key the graph holds, and among its own kind by ``repr``.
+        str | int | float | bool | None: The key in the form the canonical
+        output records it.
     """
-    masked = _sort_key(normalize_key(dependency, {}))
-    position = walk_position.get(dependency)
-    if position is None:
-        return (masked, len(walk_position), _sort_key(dependency))
-    return (masked, position, "")
+    return _json_safe(normalize_key(key, table))
 
 
 def _canonical_nested_keys(keys: _Sequence[_Any], table: dict[str, str]) -> list[_Any]:
@@ -548,6 +491,13 @@ def _canonical_nested_keys(keys: _Sequence[_Any], table: dict[str, str]) -> list
     ``__dask_keys__()`` returns a list whose elements are either keys or further
     lists of keys. Only ``list`` nesting is descended into; a ``tuple`` is a key,
     not a level of nesting, and is handled by ``normalize_key``.
+
+    Args:
+        keys: A ``__dask_keys__()`` structure: keys, or lists of them.
+        table: The object's first-appearance memo, threaded through unchanged.
+
+    Returns:
+        list: The same nesting with every key canonicalised.
     """
     canonical: list[_Any] = []
     for key in keys:
@@ -575,6 +525,15 @@ def _layer_views(
     ``__dask_graph__()``; without that the canonical form of a ``finalize()``
     result could not be compared at all, and a graph-shape regression on that path
     would go unnoticed.
+
+    Args:
+        collection: The collection whose graph this is, consulted for
+            ``__dask_layers__()`` when the graph carries no layers of its own.
+        graph: Whatever ``__dask_graph__()`` returned.
+
+    Returns:
+        tuple: The layer mapping and the layer-dependency mapping, both as plain
+        dicts in their original iteration order.
     """
     if isinstance(graph, _HighLevelGraph):
         return dict(graph.layers), dict(graph.dependencies)
@@ -630,6 +589,13 @@ def _node_func_name(node: object) -> str | None:
     ``List``/``Tuple``/``Set``/``Dict`` subclasses, which carry a bound
     ``to_container`` as ``.func``. ``dask.utils.funcname`` already unwraps
     ``functools.partial`` and maps ``methodcaller`` to its method name.
+
+    Args:
+        node: One value of a materialised graph layer.
+
+    Returns:
+        str | None: The callable's name for a ``Task``, ``None`` for any other
+        node shape.
     """
     if isinstance(node, _Task):
         return _funcname(node.func)

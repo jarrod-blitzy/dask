@@ -1,104 +1,69 @@
 """A/B performance runner for ``dask.delayed`` graph construction.
 
 The runner measures two implementations of ``delayed`` against each other inside a
-single interpreter, proves that they behave identically *before* it records a
-single timing, prints a pass/fail checklist and writes the suite's two committed
-artefacts. It is equivalence evidence as much as performance evidence: a speedup
-reported for an implementation that does something different is worthless, so the
-equivalence assertions run first and no artefact is written when one of them
-fails.
+single interpreter and proves that they behave identically *before* it records a
+single timing: for every case it compares object counts, normalised keys,
+canonical graphs and computed results, under the native keying and under
+``pure=True``. A speedup reported for an implementation that does something
+different is worthless, so a mismatch ends the run and writes no artefact at all.
 
 Arms:
     Arm A -- the frozen baseline: ``benchmarks.delayed_ab.baseline_delayed``, a
         verbatim capture of ``dask/delayed.py`` taken before the first edit of the
         refactor. It is never edited, and neither is any module it imports.
     Arm B -- the live candidate: the module object returned by
-        ``importlib.import_module("dask.delayed")``. The attribute form
-        ``dask.delayed`` is deliberately not used: ``dask/__init__.py`` executes
-        ``from dask.delayed import delayed``, which rebinds the attribute
-        ``delayed`` on the ``dask`` package, so ``import dask.delayed as m`` hands
-        back the ``delayed`` curry rather than the module.
+        ``importlib.import_module("dask.delayed")``, which is not what the
+        attribute ``dask.delayed`` holds -- see :func:`load_arms`.
 
 Arm activation:
-    Two frozen modules recognise ``Delayed`` by identity through a late-bound
-    import, so the arm under test has to be installed as ``dask.delayed`` while it
-    runs. ``dask/base.py`` lines 451-453 execute ``from dask.delayed import
-    Delayed`` inside the per-collection loop of ``collections_to_expr`` and route
-    anything that is not an instance of *that* class down the
-    ``getattr(coll, "expr", None)`` / ``__dask_exprs__`` branch;
-    ``dask/_expr.py`` lines 1336-1345 (``HLGFinalizeCompute._simplify_down``)
-    compares ``self.dsk.postcompute`` with ``Delayed.__dask_postcompute__(...)``,
-    which is the identity of the live module's ``single_key``. Without activation
-    the baseline arm's objects are foreign collections, the finalize skip does not
-    fire, and its graphs acquire extra ``finalize-hlgfinalizecompute-*`` layers.
-    ``activate`` therefore swaps ``sys.modules["dask.delayed"]`` for the duration
-    of every arm operation -- construction, equivalence extraction and every
-    compute -- and it is used for both arms so that the two run under identical
-    conditions. It exists precisely so that no frozen ``dask`` module has to be
-    edited.
+    Frozen engine code recognises ``Delayed`` by identity through a late-bound
+    import, so an arm behaves like *the* ``delayed`` implementation only while it
+    occupies ``sys.modules["dask.delayed"]``; without that, the baseline arm's
+    objects are foreign collections whose graphs acquire extra finalize layers.
+    :func:`activate` swaps that entry around every arm operation -- construction,
+    equivalence extraction and every compute -- for both arms, so the two run
+    under identical conditions and no frozen ``dask`` module has to be edited.
 
 Paired protocol:
     A round is the block A, B, B, A: four timed regions, two per arm, so that
-    drift inside the round cancels. Consecutive rounds alternate which arm starts,
-    so odd-numbered rounds run B, A, A, B. The per-round paired ratio is
-    ``(A1 + A2) / (B1 + B2)`` -- baseline over candidate, so a ratio above 1 means
-    the candidate is faster. Warmup rounds are discarded. ``time.perf_counter_ns``
-    brackets the case's ``build`` call and nothing else; the garbage collector is
-    collected and disabled around every region and collected again between rounds;
-    every computation runs on the main thread under the synchronous scheduler and
+    drift inside the round cancels. Consecutive rounds alternate which arm
+    starts: the first round runs A, B, B, A, the second B, A, A, B, and so on.
+    The per-round paired ratio is ``(A1 + A2) / (B1 + B2)`` -- baseline over
+    candidate, so a ratio above 1 means the candidate is faster. Warmup rounds
+    are discarded. ``time.perf_counter_ns`` brackets the case's ``build`` call
+    and nothing else; the garbage collector is collected and disabled around
+    every region and collected again between rounds; every computation and every
+    allocation round runs on the main thread, under the synchronous scheduler,
     outside every timed region.
-
-Allocation figures:
-    ``sys.getallocatedblocks`` deltas are recorded per timed region.
-    ``tracemalloc`` peak bytes -- the gate-bearing allocation figure -- come from
-    separate untimed rounds taken after the timing rounds, because tracing slows
-    execution two to three times. Two block figures accompany them, each under its
-    own definition and neither of them a peak: ``live_blocks_end`` and
-    ``max_observed_blocks``. The standard library exposes no peak block count at
-    all; that requirement conflict and its resolution are recorded in the
-    artefacts under ``environment.peak_block_count_conflict``.
 
 Artefacts:
     ``<output>/baseline_vs_candidate.json`` holds every raw measurement, the
-    statistics, the gate checklist and the environment block.
-    ``<output>/report.md`` holds the environment summary, one table for the gated
-    cases, one for the informational sub-series and a single closing
-    ``OVERALL:`` line. Both contain the real measured numbers of the run that
-    wrote them and are never hand-edited. The default output directory lives
-    inside the repository, and writing there is refused while the working tree is
-    dirty, so a committed artefact always describes an identifiable commit. The
-    live SHA it records is the commit whose ``dask/delayed.py`` was measured, not
-    the commit that adds the artefacts -- the sources are committed first, the
-    runner is executed from that clean commit, and its two result files are
-    committed afterwards.
-
-Invocation, from the repository root:
-    ``python -m benchmarks.delayed_ab``
-
-    ``DASK_DELAYED_AB=1 pytest dask/tests/test_delayed_ab_gate.py``
+    statistics, the gate checklist and the environment block, and
+    ``<output>/report.md`` renders the same payload for a reader; neither is ever
+    hand-edited. The default output directory lives inside the repository, and
+    writing there is refused while the working tree is dirty, so a committed
+    artefact always describes an identifiable commit -- the live SHA it records
+    is the commit whose ``dask/delayed.py`` was measured, not the commit that
+    adds the artefacts.
 
 Exit codes -- the run's own outcomes. A command line that cannot be parsed is
 rejected by ``argparse`` before the run starts, with its conventional status 2:
 
     0: every gate item held.
     1: the gate failed, or the run could not be configured or trusted -- an
-        unreadable or non-A/A ``--calibration`` file, a capture that is not the
-        frozen arm A, a measurement that cannot be interpreted, or a failure
-        while writing the artefact pair. The message names the item.
-    2: an equivalence mismatch. No artefact is written, and no performance
+        unusable ``--calibration`` file, a capture that is not the frozen arm A,
+        a measurement that cannot be interpreted, or a failure while writing the
+        artefact pair. The message names the item.
+    2: an equivalence mismatch. No artefact is written and no performance
         verdict is produced.
     3: artefacts were requested inside a repository working tree that is dirty,
-        whose state could not be established, or whose provenance changed while
-        the run was in progress. The offending paths are printed.
+        or whose state or provenance could not be trusted. The offending paths
+        are printed.
 
-Halt and report -- these are reported, never worked around:
-    * The two arms cannot be imported side by side.
-    * An A/A calibration run on unmodified code fails the equivalence assertions
-      with activation in place.
-    * A measurement appears to require a change outside ``benchmarks/delayed_ab``.
-    * A canonical graph carries a value that cannot be reproduced across
-      processes, such as an ``id()``-derived layer name from
-      ``dask/highlevelgraph.py`` lines 1002-1010.
+Four conditions are reported rather than worked around: the two arms failing to
+import side by side, an A/A calibration run that fails the equivalence
+assertions, a measurement that would need a change outside this suite, and a
+canonical graph carrying a value that cannot be reproduced across processes.
 """
 
 from __future__ import annotations
@@ -116,16 +81,16 @@ import pathlib
 import platform
 import random
 import re
+import shutil
+import stat
 import statistics
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import time
 import timeit
 import tracemalloc
-
-# Typing-support standard library modules. They carry no runtime behaviour and
-# exist only so that every definition below can be annotated.
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from types import ModuleType
@@ -134,34 +99,14 @@ from typing import Any
 from dask.base import is_dask_collection
 from dask.hashing import hashers
 
-# Intra-package imports, in the relative form. ``from .canon import ...`` inside
-# ``benchmarks.delayed_ab.main`` binds the single ``sys.modules`` entry
-# ``benchmarks.delayed_ab.canon`` -- the same module object the characterisation
-# test binds -- so the harness and the test share one canonicaliser definition and
-# the two bodies of evidence cannot drift apart.
-#
-# The absolute spelling ``from benchmarks.delayed_ab.canon import ...`` is not used
-# here for a type-checker reason rather than a preference. ``benchmarks/`` is a PEP
-# 420 namespace package (no ``__init__.py``), so mypy maps this file from its path
-# to ``delayed_ab.main`` while the absolute name resolves the same file a second
-# time as ``benchmarks.delayed_ab.main``, and it halts with ``Source file found
-# twice under different module names`` followed by ``errors prevented further
-# checking`` -- which silences the type check of the entire repository, not just
-# this tree. That error is raised while the module graph is assembled and carries
-# no error code, so no inline suppression reaches it, and both remedies mypy names
-# are out of scope here: ``benchmarks/__init__.py`` falls outside the paths the
-# run's structural criterion permits (and would make ``[tool.setuptools.packages]
-# find = {namespaces = false}`` ship this evidence tree inside the wheel), while
-# ``explicit_package_bases`` would edit the frozen ``pyproject.toml``. Applying
-# either one makes the absolute spelling work unchanged.
-#
-# The suite is always started as ``python -m benchmarks.delayed_ab``.
+# The package-relative form binds the one ``benchmarks.delayed_ab.canon`` module
+# object the characterisation test binds, so harness and test share a single
+# canonicaliser. ``benchmarks/`` is a namespace package, under which the absolute
+# spelling maps this tree's modules under a second name and mypy rejects the build.
 from .canon import canonical_graph, canonical_result, normalize_key
 from .cases import CASES, RATIO_CASES, SUBSERIES, Case
 
-# ---------------------------------------------------------------------------
 # Every magic number of the protocol, auditable in one place.
-# ---------------------------------------------------------------------------
 
 #: Measured rounds of a full run, and the floor the gate test's reduced run uses.
 _DEFAULT_ROUNDS = 15
@@ -170,6 +115,13 @@ _MIN_ROUNDS = 7
 #: Discarded warmup rounds, and their floor.
 _DEFAULT_WARMUP = 3
 _MIN_WARMUP = 2
+
+#: Ceiling on either round count. A round is four timed regions per case and
+#: every one of them is retained for the statistics, so the CPU and the memory a
+#: caller can ask for grow with these numbers and have to stop somewhere. The
+#: ceiling sits an order of magnitude above the full run's 15 measured rounds, so
+#: no legitimate invocation -- the gate test's reduced 7 included -- comes near it.
+_MAX_ROUNDS = 200
 
 #: Percentile bootstrap on the median of the per-round ratios.
 _BOOTSTRAP_RESAMPLES = 10_000
@@ -201,21 +153,118 @@ _BASELINE_BODY_SHA256 = (
 #: The frozen source arm A must reproduce, as git addresses it.
 _BASELINE_SOURCE_PATH = "dask/delayed.py"
 
+#: File name of arm A's capture, which sits beside this module.
+_BASELINE_CAPTURE_NAME = "baseline_delayed.py"
+
+#: Largest capture this runner reads. The capture has to be read whole before its
+#: digest can say whether it is the frozen source at all, and the frozen source is
+#: some 40 kB, so the bound is ample and keeps that read finite.
+_MAX_CAPTURE_BYTES = 1_048_576
+
+#: Environment variables that tell git which repository, work tree, index or
+#: object store to operate on rather than merely annotating a command. Every
+#: provenance command runs with them removed: with ``GIT_DIR`` or ``GIT_WORK_TREE``
+#: set, ``rev-parse``, ``status`` and ``show`` answer for the repository the
+#: variable names, and a dirty checkout would be published as clean under a
+#: foreign commit -- exactly what the dirty-tree refusal exists to prevent.
+#: ``XDG_CONFIG_HOME`` is stripped with them because ``$XDG_CONFIG_HOME/git/config``
+#: is a configuration source, and configuration redirects a command as
+#: effectively as ``GIT_DIR`` does.
+_GIT_ROUTING_VARIABLES = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_INDEX_FILE",
+        "GIT_INDEX_VERSION",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_WORK_TREE",
+        "XDG_CONFIG_HOME",
+    }
+)
+
+#: Absolute directories a trusted git is looked for in before the caller's
+#: ``PATH`` is consulted at all, so that a ``PATH`` entry cannot decide which
+#: executable reports on the repository. They are the platform's own default
+#: search path plus the conventional location of a locally built git. When git is
+#: reachable only through ``PATH`` -- a conda or Homebrew installation, say -- the
+#: fallback is taken and recorded as a provenance note rather than refused, since
+#: that is an ordinary installation rather than an attack.
+_TRUSTED_GIT_DIRECTORIES = (
+    "/usr/local/bin",
+    *(
+        entry
+        for entry in os.defpath.split(os.pathsep)
+        if entry and os.path.isabs(entry)
+    ),
+)
+
+#: What an executable must say about itself before this runner believes anything
+#: else it reports. ``git --version`` answers with this prefix and a stub that
+#: merely occupies the name -- ``/bin/true``, a wrapper script -- does not, so the
+#: check refuses an executable rather than trusting the provenance it prints.
+_GIT_VERSION_PREFIX = "git version "
+
+#: Prefix of the variables that inject configuration into a git command:
+#: ``GIT_CONFIG``, ``GIT_CONFIG_GLOBAL``, ``GIT_CONFIG_SYSTEM`` and the
+#: ``GIT_CONFIG_COUNT``/``GIT_CONFIG_KEY_<n>``/``GIT_CONFIG_VALUE_<n>`` triple.
+#: Configuration can set ``core.worktree`` and its like, so it redirects a command
+#: as effectively as ``GIT_DIR``; provenance is read under git's own defaults.
+_GIT_CONFIG_PREFIX = "GIT_CONFIG"
+
+#: Seconds a provenance git command may run before it is abandoned and reported as
+#: a note. ``git status`` over a large tree on a loaded machine is the slow one, so
+#: the bound is generous; it exists so that a hung git cannot stall the run.
+_GIT_TIMEOUT_SECONDS = 120
+
 #: Artefact location, relative to the repository root, and the JSON schema
 #: version that ``dask/tests/test_delayed_ab_gate.py`` parses.
 _DEFAULT_OUTPUT = "benchmarks/delayed_ab/results"
 _SCHEMA_VERSION = 1
 
-#: Suffix of the staging files the artefact pair is rendered into before either
-#: destination is replaced, so a failure between the two writes cannot leave a
-#: JSON from this run beside a report from the previous one.
-_STAGING_SUFFIX = ".staging"
+#: Largest ``--calibration`` file this reader accepts. It is external input read
+#: whole before anything in it can be validated, so the read is bounded: this
+#: suite's own A/A JSON is some 80 kB at the default round count.
+_MAX_CALIBRATION_BYTES = 8_388_608
 
-#: Suffix of the copy each destination is set aside under while the pair is
-#: published. Publication is two renames and the second one can fail, so the
-#: first destination has to be restorable from its previous contents -- without
-#: it, a failed publication leaves this run's JSON beside the previous report.
-_BACKUP_SUFFIX = ".previous"
+#: Name prefix of the private directory the artefact pair is rendered inside,
+#: and of the two staging files within it, before either destination is
+#: replaced -- so a failure between the two writes cannot leave a JSON from this
+#: run beside a report from the previous one. The directory is created 0700 with
+#: a random name and the files inside it are created exclusively, which is what
+#: makes rendering safe even though the writers take a path: no other user can
+#: unlink a staging name and leave a symbolic link in its place for the writer
+#: to follow, because they cannot write in the directory that holds it.
+_STAGING_PREFIX = ".delayed_ab_staging."
+
+#: Name prefix of the file each destination's previous contents are set aside
+#: under while the pair is published. Publication is two renames and the second
+#: one can fail, so the first destination has to be restorable from its previous
+#: contents. This name is reserved by the same random, exclusive creation, so the
+#: rename that fills it can only ever overwrite a file this run itself made.
+_BACKUP_PREFIX = ".delayed_ab_previous."
+
+#: Permissions the published artefacts carry. A committed artefact is read by
+#: everything that checks out the repository, while ``tempfile.mkstemp`` creates
+#: its staging file 0600, so the mode is set on the open descriptor before
+#: publication; without it the pair would publish owner-readable only.
+_ARTEFACT_MODE = 0o644
+
+#: Bytes read at a time when hashing what publication is about to replace. The
+#: digest is what proves a rollback, and reading a whole file into one object to
+#: compute it would make the size of whatever sits at the destination the
+#: memory the runner needs.
+_DIGEST_CHUNK_BYTES = 1 << 20
+
+#: Largest file publication will replace. An artefact of this suite is tens of
+#: kilobytes; a destination orders of magnitude larger is not one of its files,
+#: and hashing it to make its replacement reversible is unbounded work on
+#: something nothing in this run wrote. Such a destination is reported instead.
+_MAX_REPLACED_BYTES = 1 << 30
 
 #: Exit codes. ``__main__.py`` raises ``SystemExit(main())``.
 _EXIT_PASS = 0
@@ -224,12 +273,11 @@ _EXIT_EQUIVALENCE = 2
 _EXIT_DIRTY = 3
 
 #: Profile events between two ``sys.getallocatedblocks()`` samples in the
-#: ``max_observed_blocks`` run. The call itself walks the allocator's pools, so
-#: sampling it on every event costs roughly forty times the region it observes
-#: (measured: 0.21 s of construction becomes 16.8 s, while an empty hook costs
-#: 0.48 s). At this stride the same run costs 0.9 s and reports a figure within
-#: 0.5% of the every-event value, which is why the figure is documented as a
-#: sampled lower bound and never as a peak.
+#: ``max_observed_blocks`` run. The call walks the allocator's pools, so it costs
+#: far more than the profile event that triggers it: reading it on every event
+#: would dominate the construction it is meant to observe. Sampling a stride
+#: apart misses any peak that rises and falls between two samples, which is why
+#: the figure is documented as a sampled lower bound and never as a peak.
 _BLOCK_SAMPLE_STRIDE = 64
 
 #: Iterations of the ``is_dask_collection`` micro-benchmark that records the cost
@@ -247,7 +295,7 @@ _FLAT_LOOP_CONSTRUCTIONS = 10_000
 _IMPURE_BY_DEFINITION = frozenset({"pure_vs_impure", "pure_false"})
 
 #: How far an A/A calibration ratio median may sit from 1.0 before the report
-#: flags that case as arm or order bias for the reviewer to weigh.
+#: flags that case as possible arm or order bias.
 _CALIBRATION_DEVIATION = 0.05
 
 #: Distributions surfaced at the top of the environment block.
@@ -281,14 +329,7 @@ _PEAK_BLOCK_COUNT_CONFLICT = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Failure modes. Each is raised by the code that detects the problem and caught
-# once, at the orchestration boundary in ``main``, which turns it into a legible
-# message and an exit code. Nothing here is recovered from: a measurement that
-# cannot be interpreted, a capture that is not the frozen arm A and a half-written
-# artefact pair are all conditions under which this suite has no verdict to give,
-# and saying so is the whole point of raising rather than substituting a value.
-# ---------------------------------------------------------------------------
+# Failure modes, each caught once at the orchestration boundary in ``main``.
 
 
 class _MeasurementError(RuntimeError):
@@ -318,14 +359,19 @@ class _ArtefactError(RuntimeError):
     The two files are one piece of evidence. Rather than leave a JSON from this
     run beside a report from the previous one, the writer stages both, validates
     both and only then replaces the committed pair; any failure in that sequence
-    ends the run with status 1 and leaves the previous pair untouched.
+    ends the run with status 1.
+
+    What the failure leaves behind is stated in the message rather than assumed.
+    A failure before publication leaves both destinations exactly as they were. A
+    failure during publication -- two renames, which are individually atomic but
+    not one operation -- is rolled back, and the message says for each
+    destination whether its previous contents are back and sha256-verified or
+    which retained file still holds them, because a rollback that cannot be
+    completed is a fact the operator needs rather than one to suppress.
     """
 
 
-# ---------------------------------------------------------------------------
-# Records. Every measurement travels through one of these, so the payload
-# writers never have to guess what a bare tuple meant.
-# ---------------------------------------------------------------------------
+# Records: the shape every measurement travels in.
 
 
 @dataclass(frozen=True)
@@ -509,7 +555,11 @@ class _CaseResult:
         return tuple(round_.ratio for round_ in self.rounds)
 
     def timings(self, arm: str) -> tuple[int, ...]:
-        """Return one arm's region timings in measurement order."""
+        """Return one arm's region timings in measurement order.
+
+        Args:
+            arm: ``"baseline"`` or ``"candidate"``.
+        """
         return tuple(
             region.timing_ns
             for round_ in self.rounds
@@ -517,7 +567,11 @@ class _CaseResult:
         )
 
     def blocks(self, arm: str) -> tuple[int, ...]:
-        """Return one arm's per-region allocated-block deltas, same order."""
+        """Return one arm's per-region allocated-block deltas, same order.
+
+        Args:
+            arm: ``"baseline"`` or ``"candidate"``.
+        """
         return tuple(
             region.blocks_delta
             for round_ in self.rounds
@@ -525,7 +579,11 @@ class _CaseResult:
         )
 
     def allocation(self, arm: str) -> _ArmAllocation:
-        """Return one arm's allocation figures."""
+        """Return one arm's allocation figures.
+
+        Args:
+            arm: ``"baseline"`` or ``"candidate"``.
+        """
         return (
             self.baseline_allocation if arm == _BASELINE else self.candidate_allocation
         )
@@ -560,7 +618,12 @@ class _CaseResult:
 
     @staticmethod
     def _regions(round_: _Round, arm: str) -> tuple[_Region, _Region]:
-        """Return the two regions one arm contributed to a round."""
+        """Return the two regions one arm contributed to a round.
+
+        Args:
+            round_: The round to read them out of.
+            arm: ``"baseline"`` or ``"candidate"``.
+        """
         return round_.baseline if arm == _BASELINE else round_.candidate
 
 
@@ -608,11 +671,20 @@ class _RepositoryState:
         dirty_paths: The porcelain lines behind ``dirty``, for the exit-3 message.
         delayed_py_sha256: Hex digest of ``dask/delayed.py`` -- the file the
             refactor changes -- or ``None`` if it could not be read.
+        distributions: The resolved distribution name to version map, read in
+            the same pass as everything else here. The artefacts publish this
+            snapshot rather than scanning again, so the dependency set they
+            state and the gaps that decide whether they may be published are
+            one reading.
+        distribution_omissions: Every distribution left out of that map, with
+            why. Each one is also a provenance gap.
         provenance_gaps: Every provenance figure that could not be established --
-            an invalid repository root, an unavailable ``git rev-parse HEAD``, an
-            uninspectable working tree, an unreadable ``dask/delayed.py``. Empty
-            means the whole record was read successfully, and nothing but an
-            empty tuple permits a write inside the repository.
+            an invalid repository root, a git that answers for another
+            repository, an unavailable ``git rev-parse HEAD``, an uninspectable
+            working tree, an unreadable ``dask/delayed.py``, an installed
+            distribution whose metadata could not be read. Empty means the whole
+            record was read successfully, and nothing but an empty tuple permits
+            a write inside the repository.
         notes: Anything that degraded, such as a missing git executable.
     """
 
@@ -621,6 +693,8 @@ class _RepositoryState:
     dirty: bool
     dirty_paths: tuple[str, ...]
     delayed_py_sha256: str | None
+    distributions: dict[str, str]
+    distribution_omissions: tuple[str, ...]
     provenance_gaps: tuple[str, ...]
     notes: tuple[str, ...]
 
@@ -630,9 +704,7 @@ class _RepositoryState:
         return not self.provenance_gaps
 
 
-# ---------------------------------------------------------------------------
 # Arms and arm activation
-# ---------------------------------------------------------------------------
 
 
 class _ArmLoadError(RuntimeError):
@@ -647,24 +719,34 @@ class _ArmLoadError(RuntimeError):
 def load_arms() -> tuple[ModuleType, ModuleType]:
     """Import both arms and return them as ``(baseline, candidate)``.
 
+    Arm A's bytes are validated before it is imported, because importing it
+    executes its top-level code: a capture that is not the frozen source has to be
+    rejected while it is still inert, and a digest checked afterwards would only
+    describe code that had already run. After the import, the module's own
+    ``__file__`` is compared with the file that was validated, so the module that
+    will be measured is provably the one whose digest was verified.
+
     Returns:
         The frozen baseline module ``benchmarks.delayed_ab.baseline_delayed`` and
         the live ``dask.delayed`` module, as two distinct module objects.
 
     Raises:
-        _ArmLoadError: If either import fails, or if the two turn out to be the
-            same object -- meaning they cannot coexist in one process. Both are
-            halt-and-report conditions.
+        _ProvenanceError: If arm A's capture is not the frozen source, which is
+            established before the import happens.
+        _ArmLoadError: If either import fails, if the imported baseline did not
+            come from the validated capture, or if the two turn out to be the
+            same object -- meaning they cannot coexist in one process. Each is a
+            halt-and-report condition.
     """
+    capture = _validate_baseline_capture().path
     try:
         baseline = importlib.import_module("benchmarks.delayed_ab.baseline_delayed")
     except Exception as exc:
-        # Reported, never worked around: the capture and every frozen dask module
-        # stay untouched.
         raise _ArmLoadError(
             "arm A (benchmarks.delayed_ab.baseline_delayed) could not be imported: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
+    _verify_baseline_origin(baseline, capture)
     try:
         # ``importlib.import_module`` is mandatory here. ``import dask.delayed as
         # m`` would bind the *attribute* ``dask.delayed``, and ``dask/__init__.py``
@@ -708,8 +790,6 @@ def activate(mod: ModuleType) -> Iterator[ModuleType]:
         naturally at the call site.
     """
     had_previous = "dask.delayed" in sys.modules
-    # Typed ``Any`` so that restoring whatever occupied the slot needs no cast and
-    # no suppression comment.
     previous: Any = sys.modules.get("dask.delayed")
     sys.modules["dask.delayed"] = mod
     try:
@@ -721,18 +801,24 @@ def activate(mod: ModuleType) -> Iterator[ModuleType]:
             del sys.modules["dask.delayed"]
 
 
-# ---------------------------------------------------------------------------
 # Equivalence, asserted before a single timing is recorded
-# ---------------------------------------------------------------------------
 
 
 def _variant_label(pure: bool | None) -> str:
-    """Name a ``pure`` variant the way the mismatch report and checklist do."""
+    """Name a ``pure`` variant the way the mismatch report and checklist do.
+
+    Args:
+        pure: The ``pure`` value the variant was built with.
+    """
     return f"pure={pure}"
 
 
 def _truncate(value: object) -> str:
-    """Return a bounded ``repr`` so a mismatch report stays readable."""
+    """Return a bounded ``repr`` so a mismatch report stays readable.
+
+    Args:
+        value: The object to represent.
+    """
     text = repr(value)
     if len(text) <= _MISMATCH_REPR_LIMIT:
         return text
@@ -783,6 +869,10 @@ def _first_graph_difference(baseline: dict[str, Any], candidate: dict[str, Any])
     are the order-sensitive fields; a difference in one of them means the two
     arms built the same layers in a different insertion order, which is a
     behaviour change because ``tokenize`` hashes pickled slot state.
+
+    Args:
+        baseline: Arm A's canonical graph.
+        candidate: Arm B's canonical graph.
     """
     for field, baseline_value in baseline.items():
         candidate_value = candidate.get(field)
@@ -962,9 +1052,7 @@ def assert_equivalent(
     )
 
 
-# ---------------------------------------------------------------------------
 # The paired measurement protocol
-# ---------------------------------------------------------------------------
 
 
 def _ensure_fixed_hash_seed(argv: Sequence[str]) -> None:
@@ -997,7 +1085,14 @@ def _ensure_fixed_hash_seed(argv: Sequence[str]) -> None:
 
 
 def _bounded_round_count(value: str, *, minimum: int, flag: str) -> int:
-    """Parse a round count and reject anything below the protocol's floor."""
+    """Parse a round count, rejecting anything below the protocol's floor or
+    above the ``_MAX_ROUNDS`` ceiling.
+
+    Args:
+        value: The flag's raw text, as it arrived on the command line.
+        minimum: The smallest count the protocol accepts for that flag.
+        flag: The flag being parsed, named in the rejection message.
+    """
     try:
         parsed = int(value)
     except ValueError:
@@ -1009,16 +1104,30 @@ def _bounded_round_count(value: str, *, minimum: int, flag: str) -> int:
             f"{flag} must be at least {minimum} for the paired protocol to be "
             f"meaningful, got {parsed}"
         )
+    if parsed > _MAX_ROUNDS:
+        raise argparse.ArgumentTypeError(
+            f"{flag} must be at most {_MAX_ROUNDS}: each round times four regions "
+            "per case and keeps every one of them, so the work and the memory "
+            f"this run needs grow with it, got {parsed}"
+        )
     return parsed
 
 
 def _measured_rounds_argument(value: str) -> int:
-    """Argparse type for ``--rounds``: at least ``_MIN_ROUNDS``."""
+    """Argparse type for ``--rounds``: from ``_MIN_ROUNDS`` up to ``_MAX_ROUNDS``.
+
+    Args:
+        value: The flag's raw text, as it arrived on the command line.
+    """
     return _bounded_round_count(value, minimum=_MIN_ROUNDS, flag="--rounds")
 
 
 def _warmup_rounds_argument(value: str) -> int:
-    """Argparse type for ``--warmup``: at least ``_MIN_WARMUP``."""
+    """Argparse type for ``--warmup``: from ``_MIN_WARMUP`` up to ``_MAX_ROUNDS``.
+
+    Args:
+        value: The flag's raw text, as it arrived on the command line.
+    """
     return _bounded_round_count(value, minimum=_MIN_WARMUP, flag="--warmup")
 
 
@@ -1070,10 +1179,11 @@ def time_case(
     """Run the warmup and measured rounds of one case and return the measured ones.
 
     A round is the block A, B, B, A -- four regions, two per arm -- so that drift
-    inside the round cancels, and consecutive rounds alternate which arm starts,
-    so odd-numbered rounds run B, A, A, B. The alternation counts warmup rounds
-    too, so it carries on unbroken into the measured ones. The collector is
-    collected again between rounds.
+    inside the round cancels, and consecutive rounds alternate which arm starts:
+    the first round runs A, B, B, A, the second B, A, A, B, and so on. The
+    alternation is driven by the round index and counts warmup rounds too, so it
+    carries on unbroken into the measured ones. The collector is collected again
+    between rounds.
 
     Args:
         case: The case to measure.
@@ -1114,9 +1224,7 @@ def time_case(
     return tuple(measured)
 
 
-# ---------------------------------------------------------------------------
 # Statistics
-# ---------------------------------------------------------------------------
 
 
 def _arm_stats(values: Sequence[float]) -> dict[str, float]:
@@ -1194,11 +1302,8 @@ def _bootstrap_ci(
     return float(low), float(high)
 
 
-# ---------------------------------------------------------------------------
-# Allocation measurement. Every figure here comes from an untimed round: tracing
-# and profiling slow execution several times over, so none of this may ever run
-# inside a timed region.
-# ---------------------------------------------------------------------------
+# Allocation measurement. None of it may run inside a timed region: tracing and
+# profiling slow execution several times over.
 
 
 def _tracemalloc_round(
@@ -1244,12 +1349,12 @@ def _sampled_max_blocks(case: Case, mod: ModuleType, *, pure: bool | None) -> in
 
     The result is a *sampled lower bound* on the region's peak block delta and is
     never labelled a peak. ``sys.getallocatedblocks()`` walks the allocator's
-    pools, so reading it on every profile event costs roughly forty times the
-    region it observes; it is therefore read every ``_BLOCK_SAMPLE_STRIDE``th
-    event, which measured within 0.5% of the every-event figure at a fortieth of
-    the cost. The maximum is additionally floored by the count taken immediately
-    after the region, while the constructed objects are still alive, so the bound
-    can never come out below what the build demonstrably left allocated.
+    pools, so reading it on every profile event would dominate the region it
+    observes; it is read every ``_BLOCK_SAMPLE_STRIDE``th event instead, which
+    means a peak that rises and falls between two samples is missed. The maximum
+    is additionally floored by the count taken immediately after the region,
+    while the constructed objects are still alive, so the bound can never come
+    out below what the build demonstrably left allocated.
 
     Both arms are sampled identically, which is what keeps the two figures
     comparable.
@@ -1353,13 +1458,11 @@ def measure_allocations(
     return figures
 
 
-# ---------------------------------------------------------------------------
 # Environment and provenance
-# ---------------------------------------------------------------------------
 
 
 def _probe_target(x: int) -> int:
-    """A plain function: the subject of the ``is_dask_collection`` probe.
+    """Return ``x`` unchanged, as the subject of the ``is_dask_collection`` probe.
 
     It is a module-level function rather than a lambda or a local so that the
     micro-benchmark measures the probe against exactly the kind of object
@@ -1417,12 +1520,179 @@ def _invalid_root_reason(root: pathlib.Path) -> str | None:
     return None
 
 
+def _failure_detail(exc: BaseException) -> str:
+    """Describe an exception without quoting a filesystem path.
+
+    Both artefacts are committed, so a reason recorded in one has to mean the
+    same thing on another machine. The message of an OS error names the file it
+    failed on, which is a workspace path rather than durable provenance; the
+    exception's type and its ``errno`` say what happened without it.
+
+    Args:
+        exc: The exception to describe.
+
+    Returns:
+        Its class name, with ``errno`` appended when it carries one.
+    """
+    errno = getattr(exc, "errno", None)
+    if errno is None:
+        return type(exc).__name__
+    return f"{type(exc).__name__} errno {errno}"
+
+
+def _git_environment(executable: str) -> dict[str, str]:
+    """Return the environment a provenance git command runs in.
+
+    Three things are taken out of the caller's hands, because each of them
+    decides what the command reports rather than merely how it is presented.
+    Every variable that selects a repository, work tree, index or object store is
+    removed, and so is every variable that names or injects configuration, so
+    the command answers for the checkout this file was loaded from and for
+    nothing else. The system and user configuration files are then switched off
+    outright -- configuration can set ``core.worktree`` and its like -- and the
+    terminal prompt is disabled so that no command can sit waiting for input.
+    Finally the child's search path is reduced to the trusted directories plus
+    the resolved executable's own, so a caller's ``PATH`` cannot supply a helper
+    either. What is left of the environment passes through: git needs ``HOME``
+    and the locale to run, and with the configuration files off neither one
+    chooses the repository or its configuration.
+
+    Args:
+        executable: The absolute path of the git that will be run, whose own
+            directory stays on the child's search path.
+
+    Returns:
+        The environment for one git invocation.
+    """
+    controlled = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in _GIT_ROUTING_VARIABLES
+        and not name.startswith(_GIT_CONFIG_PREFIX)
+    }
+    controlled["GIT_CONFIG_NOSYSTEM"] = "1"
+    controlled["GIT_CONFIG_GLOBAL"] = os.devnull
+    controlled["GIT_TERMINAL_PROMPT"] = "0"
+    controlled["PATH"] = os.pathsep.join(
+        dict.fromkeys((os.path.dirname(executable), *_TRUSTED_GIT_DIRECTORIES))
+    )
+    return controlled
+
+
+@dataclass(frozen=True)
+class _GitProgram:
+    """The git executable every provenance command is run through.
+
+    Attributes:
+        path: Its absolute path. It is passed as ``argv[0]`` so the name ``git``
+            is never looked up again, and so one executable answers for the
+            whole run.
+        from_trusted_location: Whether it was found in one of
+            ``_TRUSTED_GIT_DIRECTORIES`` rather than through the caller's
+            ``PATH``. A ``PATH`` fallback is recorded as a provenance note by
+            :func:`_repository_state`.
+    """
+
+    path: str
+    from_trusted_location: bool
+
+
+def _git_identity_problem(candidate: str) -> str | None:
+    """Return why ``candidate`` is not git, or ``None`` when it says it is.
+
+    An executable that occupies the name decides every provenance figure this
+    runner publishes, so it has to identify itself before any of its output is
+    believed: ``--version`` is answered by git with ``_GIT_VERSION_PREFIX``, and
+    by a stub, a wrapper or an unrelated program with something else.
+
+    Args:
+        candidate: The absolute path that resolution produced.
+
+    Returns:
+        A reason, carrying no filesystem path, or ``None`` when the executable
+        identified itself as git.
+    """
+    try:
+        completed = subprocess.run(
+            [candidate, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_git_environment(candidate),
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            "the resolved git executable did not answer `--version` within "
+            f"{_GIT_TIMEOUT_SECONDS} seconds"
+        )
+    except OSError as exc:
+        return f"the resolved git executable could not be run ({_failure_detail(exc)})"
+    if completed.returncode != 0:
+        return (
+            "the resolved git executable failed `--version` with exit status "
+            f"{completed.returncode}, so it is not the git this runner will "
+            "believe about a repository"
+        )
+    if not completed.stdout.startswith(_GIT_VERSION_PREFIX):
+        return (
+            "the resolved executable does not identify itself as git: "
+            f"`--version` answered {_truncate(completed.stdout.strip())} rather "
+            f"than {_GIT_VERSION_PREFIX!r}"
+        )
+    return None
+
+
+def _git_executable() -> tuple[_GitProgram | None, str | None]:
+    """Resolve git to one absolute, self-identified executable, or say why not.
+
+    Which executable answers decides what every provenance figure means, so the
+    choice is not left to the caller's ``PATH``. The trusted system directories
+    are searched first; only when git is in none of them is ``PATH`` consulted,
+    and then with its empty and relative entries dropped, since either names the
+    working directory and would let whichever directory the run started in supply
+    the git that reports on the repository. Whatever is found must be a regular
+    file and must identify itself through :func:`_git_identity_problem`.
+
+    Returns:
+        The resolved program and ``None``, or ``None`` and an explanatory note.
+        Notes carry no filesystem path, because they reach the artefacts.
+    """
+    trusted = shutil.which("git", path=os.pathsep.join(_TRUSTED_GIT_DIRECTORIES))
+    candidate = trusted
+    if candidate is None:
+        entries = os.environ.get("PATH", "").split(os.pathsep)
+        absolute = os.pathsep.join(
+            entry for entry in entries if entry and os.path.isabs(entry)
+        )
+        candidate = shutil.which("git", path=absolute) if absolute else None
+    if candidate is None:
+        return None, (
+            "no git executable was found in a trusted system directory or on an "
+            "absolute PATH entry"
+        )
+    if not os.path.isfile(candidate):
+        return None, "the git executable that was resolved is not a regular file"
+    problem = _git_identity_problem(candidate)
+    if problem is not None:
+        return None, problem
+    return (
+        _GitProgram(path=candidate, from_trusted_location=trusted is not None),
+        None,
+    )
+
+
 def _git(root: pathlib.Path, *args: str) -> tuple[str | None, str | None]:
     """Run one git command and return ``(stdout, note)``.
 
+    The command is a list-form argv with no shell, invoked through the absolute
+    executable :func:`_git_executable` resolved, in the environment
+    :func:`_git_environment` sanitised, under a timeout.
+
     Provenance must never crash the run, so every failure -- a missing git
-    executable, a non-zero exit, a directory that is not a repository -- comes
-    back as ``(None, note)`` and the note is recorded in the environment block.
+    executable, a non-zero exit, a directory that is not a repository, a command
+    that outlives its timeout -- comes back as ``(None, note)`` and the note is
+    recorded in the environment block.
 
     Args:
         root: Repository to run the command in.
@@ -1431,19 +1701,152 @@ def _git(root: pathlib.Path, *args: str) -> tuple[str | None, str | None]:
     Returns:
         The command's stdout and ``None``, or ``None`` and an explanatory note.
     """
+    program, unavailable = _git_executable()
+    if program is None:
+        return None, unavailable
     try:
         completed = subprocess.run(
-            ["git", "-C", str(root), *args],
+            [program.path, "-C", str(root), *args],
             capture_output=True,
             text=True,
             check=False,
+            env=_git_environment(program.path),
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return None, (
+            f"`git {' '.join(args)}` did not finish within {_GIT_TIMEOUT_SECONDS} "
+            "seconds"
         )
     except OSError as exc:
-        return None, f"git could not be executed ({type(exc).__name__}: {exc})"
+        return None, f"git could not be executed ({_failure_detail(exc)})"
     if completed.returncode != 0:
         detail = completed.stderr.strip() or f"exit status {completed.returncode}"
         return None, f"`git {' '.join(args)}` failed: {detail}"
     return completed.stdout, None
+
+
+def _pointed_git_directory(
+    entry: pathlib.Path,
+) -> tuple[pathlib.Path | None, str | None]:
+    """Return the git directory a ``gitdir:`` pointer file names.
+
+    A linked worktree and a submodule have a ``.git`` file holding a single
+    ``gitdir: <path>`` line instead of a directory, so the checkout still names
+    its own repository and the comparison stays possible.
+
+    Args:
+        entry: The checkout's ``.git`` file.
+
+    Returns:
+        The directory it names, resolved, and ``None``; or ``None`` and a reason.
+    """
+    try:
+        text = entry.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return None, f"{entry} could not be read ({type(exc).__name__}: {exc})"
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("gitdir:"):
+            continue
+        target = stripped[len("gitdir:") :].strip()
+        if target:
+            named = pathlib.Path(target)
+            if not named.is_absolute():
+                named = entry.parent / named
+            return named.resolve(), None
+    return None, f"{entry} carries no `gitdir:` line naming a git directory"
+
+
+def _expected_git_directory(
+    root: pathlib.Path,
+) -> tuple[pathlib.Path | None, str | None]:
+    """Return the git directory ``root`` itself names, or why it could not be read.
+
+    Deriving the expected directory from the checkout, rather than asking git for
+    it, is what makes the comparison in :func:`_git_directory_problem` mean
+    anything.
+
+    Args:
+        root: The repository root derived from this file's location.
+
+    Returns:
+        The resolved git directory and ``None``, or ``None`` and a reason.
+    """
+    entry = root / ".git"
+    if entry.is_dir():
+        return entry.resolve(), None
+    if entry.is_file():
+        return _pointed_git_directory(entry)
+    return None, f"{entry} is neither a git directory nor a `gitdir:` pointer file"
+
+
+def _work_tree_problem(root: pathlib.Path) -> str | None:
+    """Return why git reports a work tree other than ``root``, or ``None``.
+
+    Args:
+        root: The repository root derived from this file's location.
+
+    Returns:
+        A reason naming both paths, or ``None`` when git reports ``root``.
+    """
+    toplevel, note = _git(root, "rev-parse", "--show-toplevel")
+    if toplevel is None or not toplevel.strip():
+        return note or "`git rev-parse --show-toplevel` did not report a work tree"
+    reported = pathlib.Path(toplevel.strip()).resolve()
+    if reported != root.resolve():
+        return (
+            f"git reports its work tree as {reported}, not the repository root "
+            f"{root.resolve()} this file was loaded from"
+        )
+    return None
+
+
+def _git_directory_problem(root: pathlib.Path) -> str | None:
+    """Return why git reads a repository other than ``root``'s, or ``None``.
+
+    Args:
+        root: The repository root derived from this file's location.
+
+    Returns:
+        A reason naming both directories, or ``None`` when they are the same.
+    """
+    expected, unreadable = _expected_git_directory(root)
+    if expected is None:
+        return unreadable
+    absolute, note = _git(root, "rev-parse", "--absolute-git-dir")
+    if absolute is None or not absolute.strip():
+        return note or (
+            "`git rev-parse --absolute-git-dir` did not report a git directory"
+        )
+    reported = pathlib.Path(absolute.strip()).resolve()
+    if reported != expected:
+        return (
+            f"git reads its objects from {reported}, not from {expected}, which is "
+            f"the git directory {root / '.git'} names"
+        )
+    return None
+
+
+def _git_routing_problem(root: pathlib.Path) -> str | None:
+    """Return why git does not answer for ``root``, or ``None`` when it does.
+
+    ``HEAD`` and the porcelain status are provenance only if they describe this
+    checkout, and git's answer can be pointed elsewhere -- by the environment
+    (which :func:`_git_environment` strips), by configuration, or by a ``.git``
+    entry that names another repository. The repository git actually operated on
+    is therefore verified before either figure is trusted: the work tree it
+    reports must be ``root``, and the git directory it reads must be the one
+    ``root``'s own ``.git`` entry names. Without both, a dirty tree could be
+    recorded as clean under a commit from a repository nobody measured.
+
+    Args:
+        root: The repository root derived from this file's location.
+
+    Returns:
+        The first problem found, or ``None`` when git answers for ``root``.
+    """
+    return _work_tree_problem(root) or _git_directory_problem(root)
 
 
 def _repository_state() -> _RepositoryState:
@@ -1455,13 +1858,15 @@ def _repository_state() -> _RepositoryState:
 
     Every figure that cannot be established is recorded as a provenance gap
     rather than replaced by an optimistic default. That distinction is the whole
-    control: a missing git executable, a directory that is not this repository or
-    a ``git status`` that failed all leave cleanliness *unknown*, and an unknown
-    tree is not a clean one. Reading it as clean would let the runner write a
-    committed artefact whose recorded ``git HEAD`` and ``dirty=false`` describe
-    nothing that was ever checked. Provenance still never crashes the run -- a
-    run that writes outside the checkout, which is how the A/A calibration works,
-    proceeds with the gaps recorded in the environment block.
+    control: a missing git executable, a directory that is not this repository, a
+    git that answers for some other repository, a ``git status`` that failed and
+    a dependency set that could not be read whole all leave the record
+    *unknown*, and an unknown tree is not a clean one. Reading it as clean would
+    let the runner write a committed artefact whose recorded ``git HEAD`` and
+    ``dirty=false`` describe nothing that was ever checked. Provenance still
+    never crashes the run -- a run that writes outside the checkout, which is how
+    the A/A calibration works, proceeds with the gaps recorded in the environment
+    block.
 
     Returns:
         The repository root, ``git rev-parse HEAD``, the dirty flag with the
@@ -1475,6 +1880,30 @@ def _repository_state() -> _RepositoryState:
     root_problem = _invalid_root_reason(root)
     if root_problem is not None:
         gaps.append(root_problem)
+    else:
+        routing_problem = _git_routing_problem(root)
+        if routing_problem is not None:
+            notes.append(routing_problem)
+            gaps.append(
+                "git does not answer for this checkout, so the commit and the "
+                "working-tree status it reports describe another repository"
+            )
+
+    program = _git_executable()[0]
+    if program is not None and not program.from_trusted_location:
+        notes.append(
+            "git was resolved through PATH rather than a trusted system "
+            "directory, so which executable answered the provenance commands is "
+            "a property of the environment this run was started in"
+        )
+
+    distributions, distribution_omissions = _distributions()
+    for omission in distribution_omissions:
+        notes.append(omission)
+        gaps.append(
+            "the resolved dependency set the artefacts publish is incomplete: "
+            f"{omission}"
+        )
 
     head, note = _git(root, "rev-parse", "HEAD")
     if note is not None:
@@ -1510,6 +1939,8 @@ def _repository_state() -> _RepositoryState:
         dirty=dirty,
         dirty_paths=dirty_paths,
         delayed_py_sha256=digest,
+        distributions=distributions,
+        distribution_omissions=distribution_omissions,
         provenance_gaps=tuple(gaps),
         notes=tuple(notes),
     )
@@ -1535,23 +1966,75 @@ def _cpu_model() -> str:
     return platform.processor() or "unknown"
 
 
-def _distributions() -> dict[str, str]:
-    """Return the complete resolved distribution name to version map.
+def _distribution_label(dist: importlib.metadata.Distribution) -> str:
+    """Name a distribution by its metadata directory, without a machine path.
 
-    A distribution whose metadata cannot be read is skipped rather than allowed
-    to abort the run: the map is provenance, not a measurement.
+    An omission has to be identifiable in committed evidence, and a distribution
+    whose metadata cannot be read cannot supply its own name. The directory name
+    -- ``numpy-2.4.6.dist-info`` and the like -- identifies it without carrying
+    this machine's site-packages location into the artefacts.
+
+    Args:
+        dist: The distribution that is about to be recorded as an omission.
+
+    Returns:
+        The name of its metadata directory, or a fixed phrase when the
+        distribution exposes no location at all.
+    """
+    location = getattr(dist, "_path", None)
+    if location is not None:
+        name = pathlib.Path(str(location)).name
+        if name:
+            return name
+    return "an installed distribution with no locatable metadata directory"
+
+
+def _distributions() -> tuple[dict[str, str], tuple[str, ...]]:
+    """Return the resolved distribution name to version map, and every omission.
+
+    The map is the artefacts' statement of the environment the figures were
+    measured in, so a distribution missing from it is a gap in that statement
+    rather than a detail: each one is recorded, and :func:`_repository_state`
+    keeps both the map and the omissions as one snapshot, publishes that snapshot
+    and turns every omission into a provenance gap, which refuses publication
+    inside the repository. Only the narrow failures reading installed metadata
+    actually produces are caught -- an unreadable or truncated ``METADATA`` file,
+    a distribution removed while the scan ran, metadata that declares no name.
+    Anything else is a bug and belongs in the traceback rather than in a silent
+    ``continue``.
+
+    An omission line names the distribution's metadata directory and the failure
+    by type and ``errno`` only, so the same failure reads the same way in any
+    checkout and no workspace path reaches the committed artefacts.
+
+    Returns:
+        The name to version map, sorted case-insensitively by name, and one
+        sorted line per omission naming the distribution and why it was omitted.
     """
     resolved: dict[str, str] = {}
+    omissions: list[str] = []
     for dist in importlib.metadata.distributions():
         try:
             name = dist.metadata["Name"]
             version = dist.version
-        except Exception:
+        except (OSError, KeyError, ValueError, ImportError) as exc:
+            omissions.append(
+                f"{_distribution_label(dist)} was omitted from the resolved "
+                f"dependency set: its metadata could not be read "
+                f"({_failure_detail(exc)})"
+            )
             continue
         if not name:
+            omissions.append(
+                f"{_distribution_label(dist)} was omitted from the resolved "
+                "dependency set: its metadata declares no Name field"
+            )
             continue
         resolved.setdefault(str(name), str(version))
-    return dict(sorted(resolved.items(), key=lambda item: item[0].lower()))
+    return (
+        dict(sorted(resolved.items(), key=lambda item: item[0].lower())),
+        tuple(sorted(omissions)),
+    )
 
 
 def _sanitise_path(text: str, root: pathlib.Path) -> str:
@@ -1580,6 +2063,8 @@ def _git_show_bytes(root: pathlib.Path, spec: str) -> tuple[bytes | None, str | 
 
     ``_git`` decodes to text with universal newlines, which would silently
     rewrite line endings; a digest has to be taken over the bytes git stored.
+    Everything else matches ``_git``: a shell-free argv, the absolute executable,
+    the sanitised environment and the same timeout.
 
     Args:
         root: Repository to read from.
@@ -1588,14 +2073,24 @@ def _git_show_bytes(root: pathlib.Path, spec: str) -> tuple[bytes | None, str | 
     Returns:
         The blob's bytes and ``None``, or ``None`` and an explanatory note.
     """
+    program, unavailable = _git_executable()
+    if program is None:
+        return None, unavailable
     try:
         completed = subprocess.run(
-            ["git", "-C", str(root), "show", spec],
+            [program.path, "-C", str(root), "show", spec],
             capture_output=True,
             check=False,
+            env=_git_environment(program.path),
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return None, (
+            f"`git show {spec}` did not finish within "
+            f"{_GIT_TIMEOUT_SECONDS} seconds"
         )
     except OSError as exc:
-        return None, f"git could not be executed ({type(exc).__name__}: {exc})"
+        return None, f"git could not be executed ({_failure_detail(exc)})"
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", "replace").strip() or (
             f"exit status {completed.returncode}"
@@ -1627,33 +2122,75 @@ def _capture_body(text: str) -> str:
     return ""
 
 
-def _baseline_arm() -> dict[str, Any]:
-    """Describe arm A, validating that it is the frozen source it claims to be.
+def _baseline_capture_path() -> pathlib.Path:
+    """Return the fixed path of arm A's capture, derived from this file.
 
-    Two things are checked, and both are conditions of the run rather than
-    observations about it: the capture's header must record ``_BASELINE_SHA`` in a
-    ``# Source commit:`` line, and its body -- everything below that comment
+    The path is not configurable and is never taken from an argument or an
+    environment variable: the capture that anchors every ratio the suite reports
+    is the one committed beside this module.
+    """
+    return pathlib.Path(__file__).with_name(_BASELINE_CAPTURE_NAME)
+
+
+@dataclass(frozen=True)
+class _BaselineCapture:
+    """Arm A's capture, as judged on disk before anything imported it.
+
+    Attributes:
+        path: The file every check was run against, and the only file arm A may
+            be imported from.
+        sha: The commit its header records.
+        body_sha256: The digest of its body, everything below the header.
+    """
+
+    path: pathlib.Path
+    sha: str
+    body_sha256: str
+
+
+def _validate_baseline_capture() -> _BaselineCapture:
+    """Validate arm A's capture on disk, as bytes, before anything imports it.
+
+    Every check runs on the file as it sits on disk, and each is a condition of
+    the run rather than an observation about it: the fixed path must be a regular
+    file within ``_MAX_CAPTURE_BYTES``, so the read is bounded and cannot block
+    on a directory or a pipe; the capture's header must record ``_BASELINE_SHA``
+    in a ``# Source commit:`` line; and its body -- everything below that comment
     header -- must hash to ``_BASELINE_BODY_SHA256``, the digest of
-    ``dask/delayed.py`` at that commit. When git can read the commit, the
-    expected digest is re-derived from history as well, so a tampered constant is
-    caught alongside a tampered capture.
+    ``dask/delayed.py`` at that commit.
 
-    Neither condition is a note for the reader to weigh. Arm A is the denominator
-    of every ratio the suite reports: a capture that is not the frozen source
-    turns the whole run into a comparison against something unknown, which is why
-    this is called before any timing is taken and raises rather than degrades.
+    Nothing here imports the capture. Importing it would execute its top-level
+    code, so the bytes are judged first and the module is loaded only once they
+    are the frozen source's (:func:`load_arms`).
 
     Returns:
-        The record for ``environment.arms.baseline``: the module path, the
-        header's SHA and the expected one, both body digests, whether each
-        matched, and a note when git could not corroborate the digest.
+        The validated capture: its path, the commit its header records and its
+        body digest.
 
     Raises:
-        _ProvenanceError: If the capture cannot be read, carries no
-            ``# Source commit:`` line, records a different commit, or has a body
-            that does not hash to the frozen source's digest.
+        _ProvenanceError: If the capture is not a readable regular file within
+            the size bound, carries no ``# Source commit:`` line, records a
+            different commit, or has a body that does not hash to the frozen
+            source's digest.
     """
-    capture = pathlib.Path(__file__).with_name("baseline_delayed.py")
+    capture = _baseline_capture_path()
+    if not os.path.isfile(capture):
+        raise _ProvenanceError(
+            f"arm A ({capture}) is not a regular file, so the frozen capture this "
+            "suite measures against is not there to be read"
+        )
+    try:
+        size = capture.stat().st_size
+    except OSError as exc:
+        raise _ProvenanceError(
+            f"arm A ({capture}) could not be inspected: {type(exc).__name__}: {exc}"
+        ) from exc
+    if size > _MAX_CAPTURE_BYTES:
+        raise _ProvenanceError(
+            f"arm A ({capture}) is {size} bytes, above the {_MAX_CAPTURE_BYTES}-"
+            f"byte bound. {_BASELINE_SOURCE_PATH} is some 40 kB, so a file this "
+            "large is not the capture and is not read"
+        )
     try:
         text = capture.read_text(encoding="utf-8")
     except OSError as exc:
@@ -1683,6 +2220,66 @@ def _baseline_arm() -> dict[str, Any]:
             f"{_BASELINE_SHA}. The capture is not a verbatim copy of the frozen "
             "source, so it is not the baseline this suite reports against"
         )
+    return _BaselineCapture(path=capture, sha=sha, body_sha256=body_sha256)
+
+
+def _verify_baseline_origin(module: ModuleType, capture: pathlib.Path) -> None:
+    """Confirm the imported baseline came from the capture that was validated.
+
+    Validating one file's bytes and importing a module from another would prove
+    nothing, so the imported module's own ``__file__`` is resolved and compared
+    with the validated path: what runs is what was checked.
+
+    Args:
+        module: The baseline arm, as just imported.
+        capture: The path :func:`_validate_baseline_capture` accepted.
+
+    Raises:
+        _ArmLoadError: If the module reports no origin, or an origin other than
+            the validated capture.
+    """
+    origin = getattr(module, "__file__", None)
+    if origin is None:
+        raise _ArmLoadError(
+            f"arm A ({module.__name__}) reports no __file__, so it cannot be shown "
+            f"to have been imported from the validated capture {capture}"
+        )
+    imported = pathlib.Path(origin).resolve()
+    if imported != capture.resolve():
+        raise _ArmLoadError(
+            f"arm A was imported from {imported}, not from the validated capture "
+            f"{capture.resolve()}, so the module that would be measured is not the "
+            "file whose digest was verified"
+        )
+
+
+def _baseline_arm() -> dict[str, Any]:
+    """Describe arm A, validating that it is the frozen source it claims to be.
+
+    The capture's path, header and body digest are checked by
+    :func:`_validate_baseline_capture`, and when git can read the commit the
+    expected digest is re-derived from history as well, so a tampered constant is
+    caught alongside a tampered capture.
+
+    Neither condition is a note for the reader to weigh. Arm A is the denominator
+    of every ratio the suite reports: a capture that is not the frozen source
+    turns the whole run into a comparison against something unknown, which is why
+    this is called before any timing is taken and raises rather than degrades.
+    It is called again when the environment block is assembled, which is what
+    catches a capture that is replaced while the run is in progress.
+
+    Returns:
+        The record for ``environment.arms.baseline``: the module path, the
+        header's SHA and the expected one, both body digests, whether each
+        matched, and a note when git could not corroborate the digest.
+
+    Raises:
+        _ProvenanceError: If the capture is not the frozen source, or if the
+            expected digest and the repository's own history disagree.
+    """
+    validated = _validate_baseline_capture()
+    sha = validated.sha
+    body_sha256 = validated.body_sha256
 
     note: str | None = None
     frozen_source, git_note = _git_show_bytes(
@@ -1726,8 +2323,8 @@ def _rejected_optimizations(flat_loop_median_ns: float | None) -> dict[str, Any]
     observable -- it reads ``x.expr`` / calls ``__dask_graph__()`` before
     ``unpack_collections`` does -- so reordering could change warning counts,
     mutations or exceptions in user wrappers. The optimization is therefore not
-    taken, and this is where the measured cost of not taking it enters the
-    artefacts instead of living only in the plan.
+    taken, and this function measures what keeping the probe costs so that the
+    artefacts carry that figure.
 
     Args:
         flat_loop_median_ns: The candidate's median ``flat_loop`` region, used to
@@ -1806,7 +2403,10 @@ def environment(
     gil_probe = getattr(sys, "_is_gil_enabled", None)
     py_gil_disabled = sysconfig.get_config_var("Py_GIL_DISABLED")
     gil_enabled = gil_probe() if gil_probe is not None else None
-    distributions = _distributions()
+    # The dependency set is taken from the provenance reading rather than scanned
+    # again here, so the map and the omissions these artefacts publish are the
+    # same reading that decided whether they may be published at all.
+    distributions = state.distributions
     lowered = {name.lower(): version for name, version in distributions.items()}
     packages = {name: lowered.get(name) for name in _KEY_PACKAGES}
     # ``hashers`` is a list of plain functions; ``getattr`` keeps the lookup
@@ -1848,6 +2448,10 @@ def environment(
         ),
         "hasher": active_hasher,
         "distributions": distributions,
+        # Named here rather than left silently missing from the map above. Each
+        # omission is also a provenance gap, so it refuses publication inside the
+        # repository.
+        "distribution_omissions": list(state.distribution_omissions),
         "packages": packages,
         # The five key versions, surfaced next to the complete map so that a
         # reader after one of them does not have to index into ``distributions``.
@@ -1881,9 +2485,7 @@ def environment(
     }
 
 
-# ---------------------------------------------------------------------------
 # Artefacts: the JSON payload, its report, and the calibration block
-# ---------------------------------------------------------------------------
 
 
 class _CalibrationError(RuntimeError):
@@ -1891,6 +2493,204 @@ class _CalibrationError(RuntimeError):
 
     Raised with a message for the operator instead of letting a traceback out.
     """
+
+
+#: Longest ``generated_at`` string a calibration file may carry. A UTC ISO-8601
+#: instant with microseconds is 32 characters, so the limit leaves room for the
+#: other spellings of the same instant while keeping a rejection message short.
+_CALIBRATION_TIMESTAMP_LIMIT = 64
+
+#: Relative tolerance applied when a summary figure a calibration file reports is
+#: compared with the one recomputed here from that file's own timings. The
+#: recomputation repeats this runner's arithmetic on the same integers, so a file
+#: this suite wrote agrees bit for bit; the tolerance covers float drift between
+#: interpreter builds and is orders of magnitude tighter than the difference a
+#: figure that was not derived from those timings would show.
+_CALIBRATION_RECOMPUTE_TOLERANCE = 1e-9
+
+#: Most measured rounds this reader will re-derive one entry's figures from. The
+#: median and the bootstrap interval are recomputed per entry, and the bootstrap
+#: draws ``_BOOTSTRAP_RESAMPLES`` resamples of one round each, so the work grows
+#: with the round count and an unbounded count would turn a small file into
+#: unbounded CPU. A run of this suite measures ``_DEFAULT_ROUNDS`` rounds and can
+#: be asked for as few as ``_MIN_ROUNDS``, so this ceiling leaves an order of
+#: magnitude of headroom. It bounds what the reader accepts, which is a separate
+#: question from what ``--rounds`` lets a run of this suite produce.
+_CALIBRATION_MAX_ROUNDS = 256
+
+#: Characters that carry inline Markdown or HTML meaning in the report. Text that
+#: came from outside this run is interpolated with each of them backslashed.
+_MARKDOWN_METACHARACTERS = "\\`*_[]<>|#~"
+
+
+def _calibration_agrees(recorded: float, derived: float) -> bool:
+    """Whether a reported figure equals the one recomputed from raw timings.
+
+    Args:
+        recorded: The figure the calibration file reports.
+        derived: The figure recomputed here from the timings that file carries.
+
+    Returns:
+        Whether the two agree to ``_CALIBRATION_RECOMPUTE_TOLERANCE``, relative
+        to the larger of them. Both are quotients of positive durations, so the
+        comparison needs no absolute floor. A non-finite operand agrees with
+        nothing, including itself: ``inf <= inf`` would otherwise report an
+        infinite reported figure as equal to a finite recomputed one, so the
+        comparison rejects it here as well as at the field that reads it.
+    """
+    for operand in (recorded, derived):
+        if operand != operand or operand in (float("inf"), float("-inf")):
+            return False
+    return abs(recorded - derived) <= _CALIBRATION_RECOMPUTE_TOLERANCE * max(
+        abs(recorded), abs(derived)
+    )
+
+
+def _escape_markdown(text: str) -> str:
+    """Escape externally sourced text for interpolation into the report.
+
+    The report is committed evidence, and the calibration file is the one input
+    to it this run did not produce, so its text is escaped at the point it is
+    rendered rather than trusted to a validator elsewhere: every character with
+    inline Markdown or HTML meaning is backslashed and every control character --
+    newlines included, which would otherwise let one value open report lines of
+    its own -- becomes a space.
+
+    Args:
+        text: The text to interpolate into one line of the report.
+
+    Returns:
+        The same text, renderable only as literal characters. Everything the
+        report already renders literally is returned unchanged -- letters,
+        digits, ``-``, ``.``, ``:``, ``+``, ``/`` and the rest -- so a
+        well-formed timestamp or digest renders exactly as it was recorded.
+    """
+    escaped: list[str] = []
+    for char in text:
+        if char in _MARKDOWN_METACHARACTERS:
+            escaped.append("\\" + char)
+        elif char < " " or char == "\x7f":
+            escaped.append(" ")
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
+
+def _calibration_timestamp(value: object, path: pathlib.Path) -> str:
+    """Parse the timestamp a calibration file recorded for itself.
+
+    The report interpolates this value into its environment section, so it is
+    parsed rather than accepted: one line, no control characters, and a UTC
+    ISO-8601 instant this runner can render itself. What reaches the artefacts is
+    that rendering and not the file's own string, so the published timestamp is
+    always the shape every other timestamp in the artefacts has.
+
+    Args:
+        value: The file's ``generated_at`` field as JSON parsed it.
+        path: The calibration file, for the failure messages.
+
+    Returns:
+        The instant rendered the way this runner renders every timestamp:
+        ISO-8601 with an explicit ``+00:00`` offset.
+
+    Raises:
+        _CalibrationError: If the field is absent or not a string, is longer than
+            ``_CALIBRATION_TIMESTAMP_LIMIT``, carries a control character, is not
+            an ISO-8601 instant, or carries no UTC offset -- a naive timestamp or
+            one at another offset would be published as a time it does not name.
+    """
+    if not isinstance(value, str) or not value:
+        raise _CalibrationError(
+            f"--calibration {path}: carries no 'generated_at' timestamp, so the "
+            "report could not say when the noise floor was measured"
+        )
+    if len(value) > _CALIBRATION_TIMESTAMP_LIMIT:
+        raise _CalibrationError(
+            f"--calibration {path}: its 'generated_at' is {len(value)} characters "
+            f"long, and a UTC ISO-8601 instant is at most "
+            f"{_CALIBRATION_TIMESTAMP_LIMIT}"
+        )
+    if re.search(r"[\x00-\x1f\x7f]", value) is not None:
+        raise _CalibrationError(
+            f"--calibration {path}: its 'generated_at' carries a control "
+            "character, so it is not a single-line timestamp and could add lines "
+            "of its own to the report"
+        )
+    # ``datetime.fromisoformat`` only reads a trailing "Z" on 3.11 and later while
+    # this suite supports 3.10, so both spellings of UTC are normalised to the one
+    # every supported interpreter parses.
+    spelling = f"{value[:-1]}+00:00" if value.endswith(("Z", "z")) else value
+    try:
+        parsed = datetime.datetime.fromisoformat(spelling)
+    except ValueError as exc:
+        raise _CalibrationError(
+            f"--calibration {path}: its 'generated_at' ({value!r}) is not an "
+            f"ISO-8601 timestamp ({exc})"
+        ) from exc
+    if parsed.utcoffset() != datetime.timedelta(0):
+        raise _CalibrationError(
+            f"--calibration {path}: its 'generated_at' ({value!r}) is not UTC. "
+            "Every timestamp in these artefacts is UTC, so one carrying another "
+            "offset -- or none at all -- cannot be published beside them"
+        )
+    return parsed.isoformat()
+
+
+def _calibration_figure(
+    value: object, *, what: str, where: str, path: pathlib.Path
+) -> float:
+    """Validate one number a calibration file reports as a paired ratio.
+
+    Every ratio-shaped figure the file carries -- an entry's summary figures, a
+    round's own ratio, an element of its ``ratios`` list -- passes through here,
+    so one definition of "a usable paired ratio" covers all of them and none can
+    be read with weaker checks than another.
+
+    Args:
+        value: The number as JSON parsed it.
+        what: How to name the figure in a failure message, e.g. ``ratio_median``
+            or ``ratios[3]``.
+        where: How to name the entry the figure belongs to, for the same message.
+        path: The calibration file, for the same message.
+
+    Returns:
+        The figure as a ``float``.
+
+    Raises:
+        _CalibrationError: If the value is not a number, or is one that cannot be
+            a paired ratio. ``bool`` is rejected because it is an ``int`` subclass
+            and a boolean in a numeric slot means the file is not an A/B result;
+            non-finite and non-positive values are rejected because every figure
+            here is a quotient of two positive durations, and a NaN or an
+            infinity would silently disable the comparisons that check the file
+            against its own measurements.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _CalibrationError(
+            f"--calibration {path}: {where} has {what}={value!r} "
+            f"({type(value).__name__}), which is not a number"
+        )
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        # JSON admits integers of unbounded size, and ``float`` raises on one too
+        # large to represent. That is malformed input, not a runner fault, so it
+        # is reported like every other malformed field instead of escaping.
+        raise _CalibrationError(
+            f"--calibration {path}: {where} has a {what} that is not a usable "
+            f"number ({type(exc).__name__}: {exc})"
+        ) from exc
+    if number != number or number in (float("inf"), float("-inf")):
+        raise _CalibrationError(
+            f"--calibration {path}: {where} has a non-finite {what} ({value!r})"
+        )
+    if number <= 0.0:
+        raise _CalibrationError(
+            f"--calibration {path}: {where} has {what}={number!r}, but a paired "
+            "ratio and its interval bounds are quotients of two positive "
+            "durations and cannot be zero or negative"
+        )
+    return number
 
 
 def _calibration_number(
@@ -1908,45 +2708,342 @@ def _calibration_number(
         The figure as a ``float``.
 
     Raises:
-        _CalibrationError: If the key is absent, does not hold a number, or holds
-            one that cannot be a paired ratio. ``bool`` is rejected because it is
-            an ``int`` subclass and a boolean in a numeric slot means the file is
-            not an A/B result; non-finite and non-positive values are rejected
-            because every figure here is a quotient of two positive durations,
-            and a NaN would silently disable the report's bias comparisons.
+        _CalibrationError: If the key is absent, or if its value fails any check
+            in :func:`_calibration_figure`.
     """
     if key not in entry:
         raise _CalibrationError(
             f"--calibration {path}: {where} carries no {key!r}, so it is not an "
             "A/B suite result file"
         )
-    value = entry[key]
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    return _calibration_figure(entry[key], what=key, where=where, path=path)
+
+
+def _calibration_timing(
+    round_: dict[str, Any], key: str, *, where: str, path: pathlib.Path
+) -> int:
+    """Read one timed region out of a round a calibration file recorded.
+
+    Args:
+        round_: The round object: one A,B,B,A block's four region timings.
+        key: The region to read -- ``a1``, ``a2``, ``b1`` or ``b2``.
+        where: How to name the round in a failure message.
+        path: The calibration file, for the same message.
+
+    Returns:
+        The region's duration in nanoseconds.
+
+    Raises:
+        _CalibrationError: If the region is absent, is not an integer, or is not
+            positive. ``bool`` is rejected because it is an ``int`` subclass, and
+            a non-positive duration is rejected for the reason
+            :attr:`_Round.ratio` rejects one on a live measurement: no paired
+            ratio is defined for it.
+    """
+    if key not in round_:
+        raise _CalibrationError(
+            f"--calibration {path}: {where} carries no {key!r}, so its paired "
+            "ratio cannot be recomputed from the timings it reports"
+        )
+    value = round_[key]
+    if isinstance(value, bool) or not isinstance(value, int):
         raise _CalibrationError(
             f"--calibration {path}: {where} has {key}={value!r} "
-            f"({type(value).__name__}), which is not a number"
+            f"({type(value).__name__}), and a region timing is an integer number "
+            "of nanoseconds"
         )
-    try:
-        number = float(value)
-    except (OverflowError, ValueError) as exc:
-        # JSON admits integers of unbounded size, and ``float`` raises on one too
-        # large to represent. That is malformed input, not a runner fault, so it
-        # is reported like every other malformed field instead of escaping.
+    if value <= 0:
         raise _CalibrationError(
-            f"--calibration {path}: {where} has a {key} that is not a usable "
-            f"number ({type(exc).__name__}: {exc})"
-        ) from exc
-    if number != number or number in (float("inf"), float("-inf")):
-        raise _CalibrationError(
-            f"--calibration {path}: {where} has a non-finite {key} ({value!r})"
+            f"--calibration {path}: {where} has {key}={value}, and no paired "
+            "ratio is defined for a region that took no time"
         )
-    if number <= 0.0:
+    return value
+
+
+def _calibration_round_count(raw: dict[str, Any], path: pathlib.Path) -> int:
+    """Validate the round counts a calibration file declares for itself.
+
+    The protocol's round counts are part of what makes a figure meaningful: the
+    interval this reader republishes is a bootstrap over the per-round ratios, so
+    an entry carrying one round would publish a single value as both endpoints of
+    a "95% CI". The declared counts are therefore held to the protocol's own
+    floors -- the ones ``--warmup`` and ``--rounds`` enforce on a live run -- and
+    the measured count is capped at what this reader will re-derive, and then
+    every entry is required to carry exactly that many rounds.
+
+    Args:
+        raw: The parsed calibration JSON.
+        path: The calibration file, for the failure messages.
+
+    Returns:
+        The measured round count every case and sub-series has to carry.
+
+    Raises:
+        _CalibrationError: If the file carries no ``rounds`` object, either count
+            is not an integer, either falls below the protocol's floor, or the
+            measured count exceeds ``_CALIBRATION_MAX_ROUNDS``.
+    """
+    rounds = raw.get("rounds")
+    if not isinstance(rounds, dict):
         raise _CalibrationError(
-            f"--calibration {path}: {where} has {key}={number!r}, but a paired "
-            "ratio and its interval bounds are quotients of two positive "
-            "durations and cannot be zero or negative"
+            f"--calibration {path}: carries no 'rounds' object, so nothing in it "
+            "says how many rounds its figures summarise"
         )
-    return number
+    counts: dict[str, int] = {}
+    for key, floor in (("warmup", _MIN_WARMUP), ("measured", _MIN_ROUNDS)):
+        value = rounds.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise _CalibrationError(
+                f"--calibration {path}: has rounds.{key}={value!r} "
+                f"({type(value).__name__}), which is not a round count"
+            )
+        if value < floor:
+            raise _CalibrationError(
+                f"--calibration {path}: has rounds.{key}={value}, below the "
+                f"{floor} this protocol requires, so that run did not measure "
+                "what this suite calls a round"
+            )
+        counts[key] = value
+    measured = counts["measured"]
+    if measured > _CALIBRATION_MAX_ROUNDS:
+        raise _CalibrationError(
+            f"--calibration {path}: declares {measured} measured rounds, above "
+            f"the {_CALIBRATION_MAX_ROUNDS} this reader re-derives figures from. "
+            "Every entry's median and interval are recomputed here from a "
+            f"{_BOOTSTRAP_RESAMPLES}-resample bootstrap over its rounds, so the "
+            "count is bounded rather than taken from the file"
+        )
+    return measured
+
+
+def _recomputed_ratios(
+    entry: dict[str, Any], *, rounds: int, where: str, path: pathlib.Path
+) -> list[float]:
+    """Recompute one entry's per-round paired ratios from its raw timings.
+
+    Every figure this reader publishes as a noise floor is a summary of the four
+    timings each round records, so the summaries are re-derived from those
+    timings instead of copied: each round's ``(a1 + a2) / (b1 + b2)`` is computed
+    from the integers in the file, and the ratio that round reports for itself --
+    and the entry's ``ratios`` list, where it carries one -- has to agree with the
+    recomputation.
+
+    Args:
+        entry: One case or sub-series object from the calibration file.
+        rounds: The measured round count the file declares, which this entry has
+            to carry exactly. An entry with fewer rounds than the file claims is
+            a summary of measurements it does not report.
+        where: How to name the entry in a failure message.
+        path: The calibration file, for the same message.
+
+    Returns:
+        The recomputed per-round ratios, in round order.
+
+    Raises:
+        _CalibrationError: If the entry carries no rounds or a number of them
+            other than the declared count, a round is not an object, a region
+            timing is missing or unusable, a round names a first arm that is
+            neither arm, or a reported ratio does not follow from the timings
+            recorded beside it.
+    """
+    measurements = entry.get("round_timings_ns")
+    if not isinstance(measurements, list) or not measurements:
+        raise _CalibrationError(
+            f"--calibration {path}: {where} carries no 'round_timings_ns' "
+            "measurements, so its ratio median and interval cannot be checked "
+            "against the timings they were derived from"
+        )
+    if len(measurements) != rounds:
+        raise _CalibrationError(
+            f"--calibration {path}: {where} carries {len(measurements)} round(s) "
+            f"of timings while the file declares {rounds} measured, so its "
+            "figures summarise measurements it does not report"
+        )
+    ratios: list[float] = []
+    for index, round_ in enumerate(measurements):
+        label = f"{where} round {index}"
+        if not isinstance(round_, dict):
+            raise _CalibrationError(
+                f"--calibration {path}: {label} holds {type(round_).__name__}, "
+                "not an object"
+            )
+        baseline_total = sum(
+            _calibration_timing(round_, key, where=label, path=path)
+            for key in ("a1", "a2")
+        )
+        candidate_total = sum(
+            _calibration_timing(round_, key, where=label, path=path)
+            for key in ("b1", "b2")
+        )
+        ratio = baseline_total / candidate_total
+        first_arm = round_.get("first_arm")
+        if first_arm is not None and first_arm not in (_BASELINE, _CANDIDATE):
+            raise _CalibrationError(
+                f"--calibration {path}: {label} names first_arm={first_arm!r}, "
+                f"which is neither {_BASELINE!r} nor {_CANDIDATE!r}"
+            )
+        if "ratio" in round_:
+            reported = _calibration_number(round_, "ratio", where=label, path=path)
+            if not _calibration_agrees(reported, ratio):
+                raise _CalibrationError(
+                    f"--calibration {path}: {label} reports ratio {reported!r}, "
+                    f"but its own timings give {ratio!r}, so its figures were not "
+                    "derived from the measurements it carries"
+                )
+        ratios.append(ratio)
+    _require_reported_ratios(entry, ratios, where=where, path=path)
+    return ratios
+
+
+def _require_reported_ratios(
+    entry: dict[str, Any],
+    ratios: Sequence[float],
+    *,
+    where: str,
+    path: pathlib.Path,
+) -> None:
+    """Check an entry's ``ratios`` list against the recomputed ratios.
+
+    Args:
+        entry: One case or sub-series object from the calibration file.
+        ratios: The ratios recomputed from that entry's round timings.
+        where: How to name the entry in a failure message.
+        path: The calibration file, for the same message.
+
+    Raises:
+        _CalibrationError: If the entry carries a ``ratios`` field that is not a
+            list of one usable paired ratio per round, or whose numbers do not
+            follow from the round timings. An entry carrying no such field is
+            accepted: the figures this reader publishes are checked against the
+            raw timings themselves, which no list of derived ratios can mask.
+    """
+    reported = entry.get("ratios")
+    if reported is None:
+        return
+    if not isinstance(reported, list) or len(reported) != len(ratios):
+        raise _CalibrationError(
+            f"--calibration {path}: {where} reports a 'ratios' field of "
+            f"{type(reported).__name__} against {len(ratios)} rounds of timings, "
+            "so the two do not describe the same measurement"
+        )
+    for index, value in enumerate(reported):
+        number = _calibration_figure(
+            value, what=f"ratios[{index}]", where=where, path=path
+        )
+        if not _calibration_agrees(number, ratios[index]):
+            raise _CalibrationError(
+                f"--calibration {path}: {where} reports ratios[{index}]="
+                f"{number!r}, but round {index}'s timings give {ratios[index]!r}, "
+                "so its figures were not derived from the measurements it carries"
+            )
+
+
+def _require_case_equivalence(
+    entry: dict[str, Any], *, name: str, where: str, path: pathlib.Path
+) -> None:
+    """Reject a calibration entry whose arms were not proven equivalent.
+
+    A ratio measures two implementations of one behaviour, and this suite refuses
+    to time a case whose arms disagree: it exits 2 and writes no artefact at all.
+    Every entry of a calibration file therefore carries a passing equivalence
+    verdict, and one that does not was not written by a run of this suite -- its
+    ratios compare two behaviours, which is not a noise floor.
+
+    Args:
+        entry: One case or sub-series object from the calibration file.
+        name: The entry's name, which decides whether ``pure=True`` key
+            placeholders are legitimate for it.
+        where: How to name the entry in a failure message.
+        path: The calibration file, for the same message.
+
+    Raises:
+        _CalibrationError: If the entry carries no equivalence verdict, if either
+            ``pure`` variant is not recorded as having matched, or if the
+            placeholder count is not a non-negative integer -- or is non-zero for
+            a case whose keys are deterministic, which is how a run records that
+            an exact-key comparison degraded into a structural one.
+    """
+    verdict = entry.get("equivalence")
+    if not isinstance(verdict, dict):
+        raise _CalibrationError(
+            f"--calibration {path}: {where} carries no 'equivalence' verdict, so "
+            "nothing in the file says its two arms were proven to behave "
+            "identically before they were timed"
+        )
+    for variant in ("native", "pure_true"):
+        matched = verdict.get(variant)
+        if matched is not True:
+            raise _CalibrationError(
+                f"--calibration {path}: {where} records "
+                f"equivalence.{variant}={matched!r}, i.e. that run did not prove "
+                f"the arms identical under {variant}, so its ratios compare two "
+                "behaviours rather than two implementations"
+            )
+    placeholders = verdict.get("placeholders_pure_true")
+    if (
+        isinstance(placeholders, bool)
+        or not isinstance(placeholders, int)
+        or placeholders < 0
+    ):
+        raise _CalibrationError(
+            f"--calibration {path}: {where} records "
+            f"equivalence.placeholders_pure_true={placeholders!r}, which is not a "
+            "count of key placeholders"
+        )
+    if placeholders and name not in _IMPURE_BY_DEFINITION:
+        raise _CalibrationError(
+            f"--calibration {path}: {where} needed {placeholders} key "
+            "placeholder(s) under pure=True, and only "
+            f"{', '.join(sorted(_IMPURE_BY_DEFINITION))} are impure by "
+            "definition, so that run compared this entry's keys structurally "
+            "rather than exactly"
+        )
+
+
+def _require_derived_figures(
+    figures: dict[str, float],
+    ratios: Sequence[float],
+    *,
+    where: str,
+    path: pathlib.Path,
+) -> None:
+    """Reject summary figures that do not follow from the raw timings.
+
+    The median and the interval are recomputed from the per-round ratios with the
+    same two definitions the runner applies to its own measurements -- the median
+    of the ratios, and the seeded percentile bootstrap of
+    :func:`_bootstrap_ci` -- so a file whose summaries were written by hand, or
+    copied from another corpus, is named here instead of published as this
+    machine's noise floor.
+
+    Args:
+        figures: The entry's reported ``ratio_median``, ``ci_low`` and
+            ``ci_high``, already validated as finite positive numbers.
+        ratios: The ratios recomputed from that entry's round timings.
+        where: How to name the entry in a failure message.
+        path: The calibration file, for the same message.
+
+    Raises:
+        _CalibrationError: If any of the three reported figures disagrees with
+            the one recomputed here.
+    """
+    low, high = _bootstrap_ci(ratios)
+    derived = {
+        "ratio_median": float(statistics.median(ratios)),
+        "ci_low": low,
+        "ci_high": high,
+    }
+    for key, value in derived.items():
+        if not _calibration_agrees(figures[key], value):
+            raise _CalibrationError(
+                f"--calibration {path}: {where} reports {key}={figures[key]!r}, "
+                f"but {value!r} follows from the {len(ratios)} rounds of timings "
+                "it carries (the median of (a1+a2)/(b1+b2), and the same "
+                f"{_BOOTSTRAP_RESAMPLES}-resample percentile bootstrap seeded "
+                f"with {_BOOTSTRAP_SEED} that this runner applies to its own "
+                "rounds), so its summary figures were not derived from its own "
+                "measurements"
+            )
 
 
 def _require_aa_provenance(raw: dict[str, Any], path: pathlib.Path) -> None:
@@ -1954,15 +3051,20 @@ def _require_aa_provenance(raw: dict[str, Any], path: pathlib.Path) -> None:
 
     ``--calibration`` exists to carry the machine's *noise floor* into the
     committed artefacts, and only an A/A run measures that: arm A against a live
-    ``dask/delayed.py`` that is still byte-identical to the frozen capture, whose
-    ratios therefore straddle 1.0. An A/B run's ratios are the very figures under
-    test, so copying them in as the noise floor would compare this run's speedup
-    against a previous run's speedup while labelling it "A/A calibration". The
-    identity is exact and needs no heuristic: the recorded candidate digest has to
-    be the frozen source's, the recorded baseline commit has to be
-    ``_BASELINE_SHA``, every arm-A identity field the file carries has to agree
-    with the frozen source rather than contradict it, and the commit the run
-    measured has to have been established at the time.
+    ``dask/delayed.py`` that is still byte-identical to the frozen capture, so its
+    ratios are expected to centre near 1.0. An A/B run's ratios are the very
+    figures under test, so copying them in as the noise floor would compare this
+    run's speedup against a previous run's speedup while labelling it
+    "A/A calibration".
+
+    What identifies an A/A run here is provenance, never where its ratios sit. A
+    ratio away from 1.0 is arm or order bias on that machine, which the report
+    flags per case and no gate item depends on, so it is diagnostic and is not
+    grounds for rejection. The provenance test is exact and needs no heuristic:
+    the recorded candidate digest has to be the frozen source's, the recorded
+    baseline commit has to be ``_BASELINE_SHA``, every arm-A identity field the
+    file carries has to agree with the frozen source rather than contradict it,
+    and the commit the run measured has to have been established at the time.
 
     Args:
         raw: The parsed calibration JSON.
@@ -2000,11 +3102,11 @@ def _require_aa_provenance(raw: dict[str, Any], path: pathlib.Path) -> None:
             "ratios are not this suite's noise floor"
         )
     # Every identity field the recording run wrote about arm A has to agree with
-    # the frozen source. They are checked when present rather than required,
-    # because an A/A run can only be taken before the production edit -- the live
-    # module has to still equal the capture -- so a legitimate noise floor may
-    # predate the fields a later revision of this runner records. What is never
-    # accepted is a file that carries them and contradicts them.
+    # the frozen source. These fields are optional: a calibration file may omit
+    # any of them and is still accepted, because the two required checks -- the
+    # baseline capture's commit above and the candidate arm's digest below --
+    # already establish that the file is an A/A run of the frozen source. A field
+    # that is present and contradicts the frozen source is never accepted.
     for field, expected in (
         ("expected_sha", _BASELINE_SHA),
         ("body_sha256", _BASELINE_BODY_SHA256),
@@ -2047,14 +3149,19 @@ def _load_calibration(path: pathlib.Path) -> dict[str, Any]:
     """Load and validate an earlier A/A run's ratio medians and intervals.
 
     The file is an external input to a run whose output is committed evidence, so
-    it is validated in full rather than probed: the schema version this reader was
-    written against, the timestamp, every case and sub-series this corpus defines
-    with no name missing and none unknown, three finite positive numbers per
-    entry with a coherent interval, and the A/A provenance that makes those
-    numbers a noise floor at all. Anything else is rejected with a message naming
-    what was wrong, because a calibration block silently built from one arbitrary
-    case -- or from a previous A/B run -- would be published in the report as this
-    machine's noise floor.
+    every part of it this reader uses is validated rather than probed: the schema
+    version this reader was written against; a single-line UTC ISO-8601 timestamp
+    that is re-rendered here rather than copied; round counts within the
+    protocol's own floors and this reader's ceiling; every case and sub-series
+    this corpus defines, with no name missing and none unknown; three finite
+    positive numbers per entry describing a coherent interval; a passing
+    equivalence verdict per entry; exactly as many rounds of timings as the file
+    declares, which those three numbers have to follow from, recomputed and
+    compared; and the A/A provenance that makes any of it a noise floor.
+    Anything else is rejected with a message naming what was wrong,
+    because a calibration block built from one arbitrary case -- or from a
+    previous A/B run, or from summaries nothing in the file supports -- would be
+    published in the report as this machine's noise floor.
 
     Args:
         path: The A/A JSON written by an earlier run, normally outside the
@@ -2062,24 +3169,56 @@ def _load_calibration(path: pathlib.Path) -> dict[str, Any]:
 
     Returns:
         The calibration block: the logical label of the source, the sha256 digest
-        of its bytes, the timestamp it recorded for itself, and the per-case ratio
-        median with its interval, for cases and sub-series. The file's path is
+        of the bytes it was read from, the timestamp it recorded for itself, and
+        the per-case ratio median with its interval, for cases and sub-series.
+        The file is read exactly once, so the digest identifies the same bytes
+        every published figure was validated against. The file's path is
         deliberately not carried into the block: that run's output lives in an
         ephemeral scratch directory outside the checkout, so the path describes a
         workspace layout rather than the calibration, while the digest identifies
-        the exact bytes these figures were read from.
+        the bytes.
 
     Raises:
-        _CalibrationError: If the file cannot be read, is not JSON, is not this
-            suite's schema, is missing or malformed in any validated field, or
-            was not produced by an A/A run.
+        _CalibrationError: If the file cannot be read, is not UTF-8, is not JSON,
+            is not this suite's schema, is missing or malformed in any validated
+            field, reports figures its own measurements do not support, or was
+            not produced by an A/A run.
     """
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        status = os.stat(path)
     except OSError as exc:
         raise _CalibrationError(
             f"--calibration {path}: cannot be read ({type(exc).__name__}: {exc})"
         )
+    if not os.path.isfile(path):
+        raise _CalibrationError(
+            f"--calibration {path}: is not a regular file. A directory, a socket "
+            "or a FIFO is not an A/A result JSON, and reading one could block for "
+            "as long as the other end chose"
+        )
+    if status.st_size > _MAX_CALIBRATION_BYTES:
+        raise _CalibrationError(
+            f"--calibration {path}: is {status.st_size} bytes, above the "
+            f"{_MAX_CALIBRATION_BYTES}-byte limit this reader accepts. An A/A "
+            "result JSON of this suite is a few hundred kilobytes"
+        )
+
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise _CalibrationError(
+            f"--calibration {path}: cannot be read ({type(exc).__name__}: {exc})"
+        )
+    # One read, one buffer, for both of the things the file is used for: the
+    # digest published as ``source_sha256`` and the figures copied into the
+    # artefacts are derived from these same bytes, so the file being replaced
+    # between the two -- concurrently, or between two runs -- cannot make the
+    # published digest identify bytes the published figures did not come from.
+    digest = hashlib.sha256(content).hexdigest()
+    try:
+        raw = json.loads(content.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise _CalibrationError(f"--calibration {path}: is not UTF-8 text ({exc})")
     except json.JSONDecodeError as exc:
         raise _CalibrationError(f"--calibration {path}: is not valid JSON ({exc})")
     if not isinstance(raw, dict):
@@ -2102,12 +3241,8 @@ def _load_calibration(path: pathlib.Path) -> dict[str, Any]:
             "schemas"
         )
 
-    generated_at = raw.get("generated_at")
-    if not isinstance(generated_at, str) or not generated_at.strip():
-        raise _CalibrationError(
-            f"--calibration {path}: carries no 'generated_at' timestamp, so the "
-            "report could not say when the noise floor was measured"
-        )
+    generated_at = _calibration_timestamp(raw.get("generated_at"), path)
+    measured_rounds = _calibration_round_count(raw, path)
 
     def figures(
         section: object, *, expected: tuple[str, ...], label: str
@@ -2130,9 +3265,11 @@ def _load_calibration(path: pathlib.Path) -> dict[str, Any]:
 
         Raises:
             _CalibrationError: If the section is not an object, a name is
-                missing or unknown, an entry is not an object, or any of its
-                three figures is absent, non-numeric, non-finite, non-positive
-                or describes an interval whose bounds are inverted.
+                missing or unknown, an entry is not an object, any of its three
+                figures is absent, non-numeric, non-finite, non-positive or
+                describes an interval whose bounds are inverted, its arms were
+                not proven equivalent, or its figures do not follow from the
+                round timings recorded beside them.
         """
         if not isinstance(section, dict):
             raise _CalibrationError(
@@ -2173,11 +3310,20 @@ def _load_calibration(path: pathlib.Path) -> dict[str, Any]:
                     f"--calibration {path}: {where} has ci_low {ci_low} above "
                     f"ci_high {ci_high}, which is not an interval"
                 )
-            collected[name] = {
+            # Equivalence before arithmetic: figures taken from a run that never
+            # proved its arms identical describe two behaviours, and no amount of
+            # internal consistency makes them a noise floor.
+            _require_case_equivalence(entry, name=name, where=where, path=path)
+            figures_of_entry = {
                 "ratio_median": ratio_median,
                 "ci_low": ci_low,
                 "ci_high": ci_high,
             }
+            ratios = _recomputed_ratios(
+                entry, rounds=measured_rounds, where=where, path=path
+            )
+            _require_derived_figures(figures_of_entry, ratios, where=where, path=path)
+            collected[name] = figures_of_entry
         return collected
 
     # Identity before figures: passing this run's own A/B result is the likeliest
@@ -2193,12 +3339,8 @@ def _load_calibration(path: pathlib.Path) -> dict[str, Any]:
         expected=tuple(case.name for case in SUBSERIES),
         label="subseries",
     )
-    try:
-        digest: str | None = hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        # The file parsed a moment ago, so a read that fails now leaves the
-        # figures perfectly usable and only the digest unknown.
-        digest = None
+    # The digest of the one buffer everything above was validated from, published
+    # only now that all of it has passed.
     return {
         "label": "A/A calibration run",
         "source_sha256": digest,
@@ -2209,16 +3351,12 @@ def _load_calibration(path: pathlib.Path) -> dict[str, Any]:
 
 
 def _allocation_payload(result: _CaseResult) -> dict[str, Any]:
-    """Serialise one case's allocation figures under the schema's direct keys.
+    """Serialise one case's allocation figures, one object per arm.
 
-    Each of the three measured figures is a direct key of the object whose value
-    is the per-arm map, so a reader takes
-    ``allocation["tracemalloc_peak_bytes"]["candidate"]`` without having to know
-    the arm layout first, and ``peak_bytes_ratio`` -- the only gate-bearing
-    allocation figure, candidate peak bytes over baseline peak bytes -- sits
-    beside them. The per-arm objects are kept as well, so
-    ``allocation["candidate"]`` still yields that one arm's three figures
-    together; the two forms carry the same numbers.
+    ``allocation[arm]`` holds that arm's three figures, and
+    ``peak_bytes_ratio`` -- candidate peak bytes over baseline peak bytes, the
+    only gate-bearing allocation figure -- sits beside the two arm objects. Each
+    number appears once and in one place.
 
     Args:
         result: The case's measurements, holding both arms' allocation figures.
@@ -2226,23 +3364,9 @@ def _allocation_payload(result: _CaseResult) -> dict[str, Any]:
     Returns:
         The case's ``allocation`` object.
     """
-    baseline = result.baseline_allocation
-    candidate = result.candidate_allocation
     return {
-        _BASELINE: baseline.payload(),
-        _CANDIDATE: candidate.payload(),
-        "tracemalloc_peak_bytes": {
-            _BASELINE: baseline.tracemalloc_peak_bytes,
-            _CANDIDATE: candidate.tracemalloc_peak_bytes,
-        },
-        "live_blocks_end": {
-            _BASELINE: baseline.live_blocks_end,
-            _CANDIDATE: candidate.live_blocks_end,
-        },
-        "max_observed_blocks": {
-            _BASELINE: baseline.max_observed_blocks,
-            _CANDIDATE: candidate.max_observed_blocks,
-        },
+        _BASELINE: result.baseline_allocation.payload(),
+        _CANDIDATE: result.candidate_allocation.payload(),
         "peak_bytes_ratio": result.peak_bytes_ratio,
     }
 
@@ -2355,6 +3479,10 @@ def write_json(path: pathlib.Path, payload: dict[str, Any]) -> None:
 
     The trailing newline matters: the repository's ``end-of-file-fixer``
     pre-commit hook covers the committed artefact too.
+
+    Args:
+        path: The JSON artefact to write, whose parent is created if missing.
+        payload: The run payload to serialise.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -2363,17 +3491,30 @@ def write_json(path: pathlib.Path, payload: dict[str, Any]) -> None:
 
 
 def _format_ms(nanoseconds: float) -> str:
-    """Render a nanosecond figure as milliseconds."""
+    """Render a nanosecond figure as milliseconds.
+
+    Args:
+        nanoseconds: The figure to convert.
+    """
     return f"{nanoseconds / 1e6:.3f}"
 
 
 def _format_ci(low: float, high: float) -> str:
-    """Render a confidence interval."""
+    """Render a confidence interval.
+
+    Args:
+        low: The interval's lower bound.
+        high: The interval's upper bound.
+    """
     return f"[{low:.3f}, {high:.3f}]"
 
 
 def _format_peak_delta(ratio: float) -> str:
-    """Render a peak-allocation ratio as a signed percentage change."""
+    """Render a peak-allocation ratio as a signed percentage change.
+
+    Args:
+        ratio: Candidate peak bytes over baseline peak bytes.
+    """
     return f"{(ratio - 1.0) * 100:+.1f}"
 
 
@@ -2431,12 +3572,20 @@ def write_report(path: pathlib.Path, payload: dict[str, Any]) -> None:
     when a calibration file was given, a table of the gated cases whose verdict
     cell names the threshold a failing case missed and by how much, a second table
     of the informational sub-series without a verdict column, and a single closing
-    ``OVERALL:`` line. Every number in it is measured by the run that writes it.
+    ``OVERALL:`` line. Every figure it prints is rendered from the payload the
+    JSON artefact records, so the two files always describe the same run: the
+    performance figures are that run's measurements, and the rest -- schema
+    version, configured round counts, package versions, arm provenance and any
+    copied calibration figures -- is the same metadata the payload carries.
 
     The gate checklist is deliberately not rendered here: the runner prints it to
     stdout through :func:`_print_checklist` and the JSON carries it item by item
     under ``gate.checks``, so repeating it in the report would add a section the
     report contract does not have.
+
+    Args:
+        path: The markdown artefact to write, whose parent is created if missing.
+        payload: The run payload every line is rendered from.
     """
     env = payload["environment"]
     rounds = payload["rounds"]
@@ -2499,11 +3648,17 @@ def write_report(path: pathlib.Path, payload: dict[str, Any]) -> None:
 
     calibration = payload["calibration"]
     if calibration is not None:
+        # The timestamp is the one piece of this block that originates in a file
+        # this run did not write, so it is escaped where it is interpolated. The
+        # label is a literal of this module, the digest is hexadecimal, and the
+        # case names below are the corpus registry's own -- the loader rejects any
+        # other name -- so none of those is external text to escape.
         lines.append(
             f"- A/A calibration source: {calibration['label']}, sha256 "
             f"{calibration['source_sha256']} (generated "
-            f"{calibration['generated_at']}). Its path is not recorded: that run "
-            "writes outside the checkout so the tree stays clean, which makes the "
+            f"{_escape_markdown(calibration['generated_at'])}). Its path is not "
+            "recorded: that run writes outside the checkout so the tree stays "
+            "clean, which makes the "
             "location ephemeral and the digest the durable identifier. The A/A "
             "ratios are the noise floor of this machine; they are diagnostic, not "
             "a gate."
@@ -2532,14 +3687,22 @@ def write_report(path: pathlib.Path, payload: dict[str, Any]) -> None:
 
 
 def _format_ratio_or_none(value: object) -> str:
-    """Render a float figure, or ``n/a`` when it could not be derived."""
+    """Render a float figure, or ``n/a`` when it could not be derived.
+
+    Args:
+        value: The JSON value to render, of any type.
+    """
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return f"{float(value):.3f}"
     return "n/a"
 
 
 def _numeric(value: object) -> float | None:
-    """Return a JSON number as a ``float``, or ``None`` for anything else."""
+    """Return a JSON number as a ``float``, or ``None`` for anything else.
+
+    Args:
+        value: The JSON value to read, of any type.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
@@ -2549,11 +3712,12 @@ def _calibration_bias_note(figures: dict[str, Any]) -> str:
     """Flag an A/A case whose paired ratio is not centred on 1.0.
 
     An A/A run compares the baseline against itself, so its ratios are the noise
-    floor and should straddle 1.0. A case whose median is more than
+    floor and are expected to centre near 1.0. A case whose median is more than
     ``_CALIBRATION_DEVIATION`` away from 1.0, or whose interval excludes 1.0
     altogether, is measuring something other than the implementations -- arm or
-    order bias on that machine -- and says so in the report's environment section
-    for the reviewer to weigh. It is diagnostic: no gate item depends on it.
+    order bias on that machine -- and the note this returns says so on that case's
+    calibration line, so that whoever reads the artefacts sees it beside the
+    figure it qualifies. It is diagnostic: no gate item depends on it.
 
     Args:
         figures: One case's ``ratio_median``, ``ci_low`` and ``ci_high`` from the
@@ -2580,7 +3744,13 @@ def _calibration_bias_note(figures: dict[str, Any]) -> str:
 
 
 def _format_share(value: object) -> str:
-    """Render a share of one construction as a percentage, or ``n/a``."""
+    """Render a share of one construction as a percentage, else ``share n/a``.
+
+    Args:
+        value: The share to render. Anything that is not a real number yields
+            the literal ``share n/a``, which reads as written inside the
+            parenthesis of the report line it is substituted into.
+    """
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return f"{float(value) * 100:.2f}% of one construction"
     return "share n/a"
@@ -2690,64 +3860,558 @@ def _validate_staged_report(staged: pathlib.Path, payload: dict[str, Any]) -> No
     if not text.endswith("\n"):
         raise _ArtefactError(f"the staged report {staged} has no trailing newline")
     expected = f"OVERALL: {verdict}"
-    overall = [line for line in text.splitlines() if line.startswith("OVERALL:")]
+    lines = text.splitlines()
+    overall = [line for line in lines if line.startswith("OVERALL:")]
     if overall != [expected]:
         raise _ArtefactError(
             f"the staged report {staged} does not close with this run's verdict: "
             f"expected exactly one {expected!r} line, found {overall}"
         )
+    # Uniqueness is not the whole rule: the report closes with that single line
+    # (AAP §0.4.5), which is what a reader looks at last. ``write_report``
+    # renders it as the last line followed by the trailing newline, so nothing
+    # may come after it.
+    if lines[-1] != expected:
+        raise _ArtefactError(
+            f"the staged report {staged} does not end with its OVERALL line: "
+            f"expected {expected!r} as the last line, found {lines[-1]!r}"
+        )
 
 
-def _publish_artefact(
-    staged: pathlib.Path, destination: pathlib.Path
-) -> pathlib.Path | None:
-    """Move one staged artefact onto its destination, keeping what it replaced.
+@dataclass(frozen=True)
+class _Replaced:
+    """What one published artefact displaced, and how to prove it back.
 
-    The previous contents are renamed aside first, so the move can be undone if a
-    later one in the same pair fails. If the move itself fails, this function
-    puts the previous contents straight back before propagating, leaving the
-    destination as it found it.
+    Attributes:
+        destination: The path that was published.
+        backup: The file this run created exclusively and renamed the
+            destination's previous contents into, or ``None`` when the
+            destination did not exist -- in which case undoing publication means
+            removing what was published.
+        digest: Hex sha256 of those previous contents, or ``None`` when there
+            were none. Restoration counts as successful only when the restored
+            destination hashes to this digest again, which is what turns
+            "rolled back" from a claim into a checked fact.
+    """
+
+    destination: pathlib.Path
+    backup: pathlib.Path | None
+    digest: str | None
+
+
+def _new_staging_file(directory: pathlib.Path, prefix: str) -> tuple[pathlib.Path, int]:
+    """Create an empty file in ``directory`` under a name only this run knows.
+
+    ``tempfile.mkstemp`` opens with ``O_CREAT|O_EXCL`` -- plus ``O_NOFOLLOW``
+    wherever the platform defines it -- at mode 0600 and a random name, so the
+    returned path cannot be an existing file, a symbolic link to one, or a name
+    another process arranged in advance. A name derived from a destination would
+    be none of those things: in a writable output directory it is a name
+    something else can create first, and writing it would follow what it found.
+
+    The descriptor is returned with the path and the caller holds it open until
+    cleanup. While it is open the inode cannot be recycled, which is what lets
+    :func:`_verify_staged_identity` state that the path still names this file.
 
     Args:
-        staged: The validated staging file.
+        directory: The directory the file is created in -- the private staging
+            directory for a file an artefact is rendered into, or the output
+            directory itself for a set-aside name, which receives its contents
+            by rename rather than by a write through its path. Both sit on the
+            destination's filesystem so that publication is a rename.
+        prefix: ``_STAGING_PREFIX`` for a file an artefact is rendered into, or
+            ``_BACKUP_PREFIX`` for a name reserved for previous contents.
+
+    Returns:
+        The created path and its open file descriptor.
+
+    Raises:
+        _ArtefactError: If no such file could be created, which is the same
+            failure as being unable to write the artefacts at all.
+    """
+    try:
+        handle, name = tempfile.mkstemp(dir=directory, prefix=prefix)
+    except OSError as exc:
+        raise _ArtefactError(
+            f"no staging file could be created in {directory}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    return pathlib.Path(name), handle
+
+
+def _new_staging_dir(directory: pathlib.Path) -> pathlib.Path:
+    """Create a private directory inside ``directory`` to render the pair in.
+
+    The artefact writers take a path and reopen it, which is a window: between a
+    staging file being created and being written, another writer in the output
+    directory could unlink the name and leave a symbolic link there for the
+    write to follow. ``tempfile.mkdtemp`` closes it by construction -- the
+    directory is created with a random name and mode 0700, so no other user can
+    create, replace or remove anything inside it -- while keeping the staging
+    files on the destination's filesystem, which is what lets publication be a
+    rename rather than a copy.
+
+    Args:
+        directory: The output directory, already established as one artefacts
+            may be written into.
+
+    Returns:
+        The created directory.
+
+    Raises:
+        _ArtefactError: If it could not be created.
+    """
+    try:
+        return pathlib.Path(tempfile.mkdtemp(dir=directory, prefix=_STAGING_PREFIX))
+    except OSError as exc:
+        raise _ArtefactError(
+            f"no staging directory could be created in {directory}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _verify_staged_identity(path: pathlib.Path, fd: int) -> None:
+    """Prove a staging path still names the file this run created there.
+
+    The writers take a path, not a descriptor, so between creation and the write
+    the name could have been replaced by a symbolic link or another file -- and
+    the contents would then have been written somewhere this run never chose.
+    Comparing ``os.lstat`` on the name (never following a link) against
+    ``os.fstat`` on the descriptor held open since creation settles it: same
+    device and inode, and a regular file, or the contents are not published.
+
+    Args:
+        path: The staging path returned by :func:`_new_staging_file`.
+        fd: The descriptor returned with it, still open.
+
+    Raises:
+        _ArtefactError: If the path cannot be inspected, is no longer a regular
+            file, or no longer names the file the descriptor refers to.
+    """
+    try:
+        named = os.lstat(path)
+        created = os.fstat(fd)
+    except OSError as exc:
+        raise _ArtefactError(
+            f"the staging file {path} could not be inspected before "
+            f"publication: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not stat.S_ISREG(named.st_mode):
+        raise _ArtefactError(
+            f"the staging path {path} is no longer a regular file "
+            f"({stat.filemode(named.st_mode)}), so what it names was not "
+            f"written by this run"
+        )
+    if (named.st_dev, named.st_ino) != (created.st_dev, created.st_ino):
+        raise _ArtefactError(
+            f"the staging path {path} no longer names the file this run created "
+            f"there, so its contents are not this run's artefact and are not "
+            f"published"
+        )
+
+
+def _names_descriptor(path: pathlib.Path, fd: int) -> bool:
+    """Whether ``path`` still names the regular file ``fd`` refers to.
+
+    The same question :func:`_verify_staged_identity` raises on, asked where the
+    answer decides whether to remove a name rather than whether to publish its
+    contents: a staging name that turns out to identify something else is left
+    alone, because removing it would delete an entry this run did not create.
+
+    Args:
+        path: The staging path to test.
+        fd: The descriptor it was created with, still open.
+
+    Returns:
+        ``True`` only when the name still identifies that file.
+    """
+    try:
+        named = os.lstat(path)
+        created = os.fstat(fd)
+    except OSError:
+        return False
+    return stat.S_ISREG(named.st_mode) and (named.st_dev, named.st_ino) == (
+        created.st_dev,
+        created.st_ino,
+    )
+
+
+def _unsafe_destination_reason(destination: pathlib.Path) -> str | None:
+    """Return why a destination may not be replaced, or ``None`` when it may.
+
+    Only a regular file, or nothing at all, is replaceable. A symbolic link is
+    refused outright -- replacing one either follows it to a file the runner
+    never chose or silently discards it -- and so is a directory, FIFO, socket or
+    device node. The test is ``os.lstat``, not ``Path.exists``, because the
+    question is what the name itself is and not what it points at.
+
+    Args:
+        destination: The published path an artefact would replace.
+
+    Returns:
+        The reason it may not be replaced, or ``None``.
+    """
+    try:
+        named = os.lstat(destination)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return (
+            f"{destination} cannot be inspected ({type(exc).__name__}: {exc}), "
+            f"so what would be replaced is unknown"
+        )
+    if stat.S_ISLNK(named.st_mode):
+        return f"{destination} is a symbolic link, and publication follows none"
+    if not stat.S_ISREG(named.st_mode):
+        return (
+            f"{destination} is not a regular file "
+            f"({stat.filemode(named.st_mode)}), so it is not an artefact this "
+            f"run may replace"
+        )
+    return None
+
+
+def _git_metadata_dir(root: pathlib.Path) -> pathlib.Path | None:
+    """Locate the repository's git metadata directory without invoking git.
+
+    ``root/.git`` is a directory in an ordinary checkout, a regular file holding
+    a single ``gitdir: <path>`` line in a linked worktree or a submodule, where a
+    relative path is relative to ``root``, and in either case it may be reached
+    through a symbolic link, which is followed here so that a linked marker
+    protects its target rather than nothing. All of them are read here directly
+    rather than asked of ``git rev-parse --git-dir``, because the
+    directory that must be protected from artefact writes is the one belonging to
+    the checkout this module was loaded from, and ``GIT_DIR``, ``GIT_COMMON_DIR``
+    and their relatives in the caller's environment can point git at another
+    repository entirely.
+
+    Args:
+        root: The repository root, as :func:`_repository_root` derives it.
+
+    Returns:
+        The resolved metadata directory, or ``None`` when there is no ``.git``
+        entry, when it resolves to neither a directory nor a readable ``gitdir``
+        file, or when the path it names cannot be resolved. ``None`` means "no
+        metadata directory to protect", and the caller still refuses any path
+        carrying a ``.git`` component.
+    """
+    marker = root / ".git"
+    try:
+        resolved = marker.resolve()
+        named = os.stat(resolved)
+    except OSError:
+        return None
+    if stat.S_ISDIR(named.st_mode):
+        return resolved
+    if not stat.S_ISREG(named.st_mode):
+        return None
+    try:
+        text = resolved.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in text.splitlines():
+        if not line.startswith("gitdir:"):
+            continue
+        target = line[len("gitdir:") :].strip()
+        if not target:
+            return None
+        gitdir = pathlib.Path(target)
+        if not gitdir.is_absolute():
+            gitdir = root / gitdir
+        try:
+            return gitdir.resolve()
+        except OSError:
+            return None
+    return None
+
+
+def _unsafe_output_reason(output: pathlib.Path) -> str | None:
+    """Return why artefacts may not be written into ``output``, or ``None``.
+
+    Three kinds of directory are refused, all of them before anything is created:
+
+    * anything with a ``.git`` path component -- tested on the path as given as
+      well as on its resolved form, because a symbolic link named ``.git``
+      resolves the component away -- or anything at or below the metadata
+      directory :func:`_git_metadata_dir` resolves. An output directory there
+      would have the runner writing two files of its own into the object, ref or
+      worktree state of a repository, which is never an artefact location and is
+      exactly the ``--output .git/refs/heads`` case;
+    * an existing path that is not a directory, which cannot hold a pair;
+    * a path that cannot be resolved at all, because a location that cannot be
+      named cannot be reasoned about either.
+
+    Args:
+        output: The output directory, as ``--output`` resolved it.
+
+    Returns:
+        The reason writing there is refused, or ``None`` when it is allowed.
+    """
+    try:
+        resolved = output.resolve()
+    except OSError as exc:
+        return (
+            f"{output} cannot be resolved to a location on disk "
+            f"({type(exc).__name__}: {exc})"
+        )
+    absolute = output if output.is_absolute() else pathlib.Path.cwd() / output
+    if ".git" in absolute.parts or ".git" in resolved.parts:
+        return (
+            f"{output} lies under a .git path component, which is repository "
+            f"metadata and never an artefact location"
+        )
+    metadata = _git_metadata_dir(_repository_root())
+    if metadata is not None and (
+        resolved == metadata or resolved.is_relative_to(metadata)
+    ):
+        return (
+            f"{resolved} is the repository's git metadata directory {metadata} "
+            f"or inside it, which is never an artefact location"
+        )
+    try:
+        named = os.lstat(resolved)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return (
+            f"{resolved} cannot be inspected ({type(exc).__name__}: {exc}), so "
+            f"it is not known to be a directory"
+        )
+    if not stat.S_ISDIR(named.st_mode):
+        return (
+            f"{resolved} exists and is not a directory "
+            f"({stat.filemode(named.st_mode)})"
+        )
+    return None
+
+
+def _file_digest(path: pathlib.Path) -> str:
+    """Return the hex sha256 of a file's contents, read in bounded chunks.
+
+    The file is read ``_DIGEST_CHUNK_BYTES`` at a time rather than into one
+    object, so the memory this needs is fixed instead of being whatever sits at
+    the path, and a file larger than ``_MAX_REPLACED_BYTES`` is refused before
+    any of it is read rather than hashed indefinitely. Both matter because the
+    path is a destination the run is about to replace, and nothing guarantees
+    that what is there now is the small artefact a previous run left.
+
+    Args:
+        path: The file to hash. Callers hash only paths they have already
+            established are regular files.
+
+    Returns:
+        The hex digest.
+
+    Raises:
+        OSError: If the contents could not be read, or if the file is larger
+            than ``_MAX_REPLACED_BYTES``. Publication turns either into a
+            refusal rather than a warning: contents that cannot be captured
+            cannot be proven restored either.
+    """
+    size = path.stat().st_size
+    if size > _MAX_REPLACED_BYTES:
+        raise OSError(
+            f"{path} is {size} bytes, more than the {_MAX_REPLACED_BYTES} this "
+            f"run will hash to make a replacement reversible"
+        )
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(_DIGEST_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _publish_artefact(staged: pathlib.Path, destination: pathlib.Path) -> _Replaced:
+    """Move one staged artefact onto its destination, keeping what it replaced.
+
+    The sequence is deliberate and every step is a precondition for undoing the
+    next. The destination is inspected first and refused unless it is a regular
+    file or absent, so nothing is ever published through a symbolic link or over
+    a directory. Its current contents are hashed, because a rollback that cannot
+    be verified is not one. They are then renamed into a file this run created
+    exclusively under a random name -- never a name derived from the destination,
+    which something else could have created first -- and only then does the
+    staged file take the destination's place.
+
+    Nothing is suppressed. When a rename fails, the raised message says both what
+    failed and what became of the previous contents: back in place and
+    sha256-verified, or retained under a file it names so a human can restore
+    them by hand.
+
+    Args:
+        staged: The validated staging file, whose identity has been verified.
         destination: The published path it replaces.
 
     Returns:
-        The path the previous contents were set aside under, or ``None`` when the
-        destination did not exist.
+        The record of what publication displaced, which is what
+        :func:`_unpublish_artefact` needs to undo it and to prove it undone.
 
     Raises:
-        OSError: If the rename could not be performed. The destination is
-            unchanged when this happens.
+        _ArtefactError: If the destination may not be replaced, if its current
+            contents could not be hashed -- a destination that cannot be
+            captured has no verifiable rollback, so it is left untouched rather
+            than replaced on the quiet -- or if either rename failed.
     """
+    reason = _unsafe_destination_reason(destination)
+    if reason is not None:
+        raise _ArtefactError(f"the artefact destination may not be replaced: {reason}")
+    digest: str | None = None
     backup: pathlib.Path | None = None
-    if destination.exists():
-        backup = destination.with_name(destination.name + _BACKUP_SUFFIX)
-        os.replace(destination, backup)
+    if os.path.lexists(destination):
+        try:
+            digest = _file_digest(destination)
+        except Exception as exc:
+            # Deliberately broad: a destination that cannot be hashed for any
+            # reason -- unreadable, too large to bound, or anything the runner
+            # has not thought of -- is one whose replacement could not be proven
+            # undone, and that is a refusal with a message rather than an
+            # exception escaping past the rollback machinery.
+            raise _ArtefactError(
+                f"the artefact already at {destination} could not be read, so "
+                f"replacing it could not have been rolled back with proof; it "
+                f"was left untouched: {type(exc).__name__}: {exc}"
+            ) from exc
+        backup, handle = _new_staging_file(destination.parent, _BACKUP_PREFIX)
+        # The name is what was needed; the rename below supplies the contents.
+        os.close(handle)
+        try:
+            os.replace(destination, backup)
+        except OSError as exc:
+            # Nothing was set aside, so the reserved file is empty and removing
+            # it is the whole of the cleanup -- and it is a file this run made.
+            stray = ""
+            try:
+                backup.unlink()
+            except OSError as cleanup_exc:
+                stray = (
+                    f"; the empty reserved file {backup} could not be removed "
+                    f"either ({type(cleanup_exc).__name__}: {cleanup_exc})"
+                )
+            raise _ArtefactError(
+                f"the artefact already at {destination} could not be set aside, "
+                f"so nothing was published and it still holds its own contents "
+                f"(sha256 {digest}){stray}: {type(exc).__name__}: {exc}"
+            ) from exc
     try:
         os.replace(staged, destination)
-    except OSError:
-        if backup is not None:
-            with contextlib.suppress(OSError):
-                os.replace(backup, destination)
-        raise
-    return backup
+    except OSError as exc:
+        failure = _unpublish_artefact(_Replaced(destination, backup, digest))
+        if failure is None:
+            outcome = (
+                f"{destination} holds its previous contents again (sha256 "
+                f"{digest} verified)"
+                if digest is not None
+                else f"{destination} does not exist again, as it did not before"
+            )
+        else:
+            outcome = failure
+        raise _ArtefactError(
+            f"the staged artefact {staged} could not be moved onto "
+            f"{destination} ({type(exc).__name__}: {exc}); {outcome}"
+        ) from exc
+    return _Replaced(destination, backup, digest)
 
 
-def _unpublish_artefact(destination: pathlib.Path, backup: pathlib.Path | None) -> None:
-    """Undo one published artefact, restoring what was there before it.
+def _unpublish_artefact(record: _Replaced) -> str | None:
+    """Undo one published artefact, restoring and verifying what it replaced.
+
+    Restoration is proven rather than attempted: the set-aside file is renamed
+    back and the destination is hashed again, and only a digest equal to the one
+    captured before publication counts as restored. A failure is returned, not
+    swallowed, so the caller can put it in front of the operator, and the file
+    holding the previous contents is deliberately left on disk in that case --
+    deleting it is what would make the previous pair unrecoverable.
 
     Args:
-        destination: The path that was published.
-        backup: The set-aside previous contents, or ``None`` when the
-            destination did not exist before publication -- in which case
-            undoing means removing it again.
+        record: What the publication displaced, as :func:`_publish_artefact`
+            returned it.
+
+    Returns:
+        ``None`` when the destination provably holds what it held before this
+        run, or the reason it does not -- naming the retained file that still
+        holds the previous contents whenever there is one.
     """
-    with contextlib.suppress(OSError):
-        if backup is None:
-            destination.unlink(missing_ok=True)
+    if record.backup is None:
+        try:
+            record.destination.unlink(missing_ok=True)
+        except OSError as exc:
+            return (
+                f"{record.destination} did not exist before this run and could "
+                f"not be removed again ({type(exc).__name__}: {exc}), so it is "
+                f"left holding this run's output"
+            )
+        return None
+    try:
+        os.replace(record.backup, record.destination)
+    except OSError as exc:
+        return (
+            f"{record.destination} could not be restored "
+            f"({type(exc).__name__}: {exc}); its previous contents are retained "
+            f"in {record.backup} (sha256 {record.digest}) and must be moved back "
+            f"by hand"
+        )
+    try:
+        restored = _file_digest(record.destination)
+    except Exception as exc:
+        # Broad for the same reason as the capture: a verification that cannot
+        # be completed is an outcome to report, never an exception that escapes
+        # a rollback and leaves the caller without one.
+        return (
+            f"{record.destination} was moved back into place but could not be "
+            f"read to verify it ({type(exc).__name__}: {exc}); the contents it "
+            f"held before this run hashed to {record.digest}"
+        )
+    if restored != record.digest:
+        return (
+            f"{record.destination} was moved back into place but hashes to "
+            f"{restored}, not the {record.digest} it held before this run"
+        )
+    return None
+
+
+def _roll_back_published(published: Sequence[_Replaced]) -> str:
+    """Undo every published artefact in reverse and describe what that achieved.
+
+    Reverse order matters: the destination published last is the one whose
+    previous contents were set aside most recently, and undoing in that order is
+    what leaves neither destination holding this run's output beside the
+    previous run's. Each outcome is taken from :func:`_unpublish_artefact` rather
+    than assumed, so a restoration that could not be completed appears in the
+    text with the file that still holds the contents.
+
+    Args:
+        published: The records of what has been published so far, in publication
+            order.
+
+    Returns:
+        One sentence-length description per destination, joined for a message,
+        ending with a note about retained files when any restoration failed.
+    """
+    restored: list[str] = []
+    failures: list[str] = []
+    for record in reversed(published):
+        failure = _unpublish_artefact(record)
+        if failure is not None:
+            failures.append(failure)
+        elif record.digest is not None:
+            restored.append(
+                f"{record.destination} holds its previous contents again "
+                f"(sha256 {record.digest} verified)"
+            )
         else:
-            os.replace(backup, destination)
+            restored.append(
+                f"{record.destination} does not exist again, as it did not "
+                f"before this run"
+            )
+    rollback = "; ".join([*restored, *failures]) or (
+        "nothing had been published, so both destinations are as before"
+    )
+    if failures:
+        rollback += (
+            ". The files named as retained are kept deliberately: they hold the "
+            "only copy of the previous contents"
+        )
+    return rollback
 
 
 def _write_artefact_pair(
@@ -2760,18 +4424,36 @@ def _write_artefact_pair(
     in either file says they disagree. Two things are needed to rule that out, and
     the sequence here does both.
 
-    First, both artefacts are rendered into staging files beside their
-    destinations and read back -- the JSON reparsed and compared against the
-    whole payload, the report checked for this run's closing verdict -- so a
-    rendering failure never reaches a destination at all.
+    First, both artefacts are rendered inside a private staging directory
+    created 0700 with a random name in the output directory. The writers take a
+    path and reopen it, so the directory is what makes rendering safe: no other
+    user can unlink a staging name and leave a symbolic link for the write to
+    follow, because they cannot write in the directory holding it. Each staging
+    file is additionally created exclusively, its identity is checked against the
+    descriptor it was created with before it is validated and again before it is
+    published, and both are read back -- the JSON reparsed and compared against
+    the whole payload, the report checked for this run's closing verdict on its
+    closing line -- so neither a rendering failure nor a swapped staging path
+    reaches a destination at all.
 
-    Second, publication itself is undone on failure. Moving two files is two
-    renames, and the second one can fail after the first has succeeded; that is
-    exactly how a mixed pair would appear. So each destination's previous
-    contents are set aside before it is replaced, and if a later move in the pair
-    fails, the earlier ones are put back. Whatever happens, the caller is left
-    with both artefacts from this run or both from before it, and no staging or
-    set-aside file behind.
+    Second, publication is undone on failure, and the undoing is verified.
+    Moving two files is two renames: each one is atomic, the pair of them is not,
+    and the second can fail after the first has succeeded -- which is exactly how
+    a mixed pair would appear. So each destination's previous contents are hashed
+    and set aside before it is replaced, and anything at all that stops
+    publication afterwards -- a failed rename, a refused destination, an
+    interrupt between the two -- moves the earlier ones back and hashes them
+    again to prove it.
+
+    What that guarantees is therefore precise rather than absolute: the caller is
+    left either with both artefacts from this run, or with both from before it
+    and each restoration confirmed by digest. When a restoration cannot be
+    completed -- the only case in which neither holds -- the failure names the
+    file that holds the previous contents, and that file is deliberately kept.
+    Staging files and the directory holding them are removed either way, but only
+    while they still identify what this run created; a name that turns out to
+    identify something else is left alone and reported, and no name derived from
+    a destination is ever created, replaced or removed.
 
     Args:
         json_path: Destination of the JSON artefact.
@@ -2779,15 +4461,48 @@ def _write_artefact_pair(
         payload: The run payload both artefacts describe.
 
     Raises:
-        _ArtefactError: If either artefact could not be written, could not be
-            read back, does not describe this run, or could not be published.
-            Both destinations hold their previous contents in every one of those
-            cases.
+        _ArtefactError: If the output directory may not be written to or could
+            not be created, if either artefact could not be staged, verified,
+            read back or validated -- in all of which cases both destinations
+            still hold their previous contents -- or if publication failed, in
+            which case the message states each destination's rollback outcome
+            and every retained file. A ``KeyboardInterrupt`` or ``SystemExit``
+            during publication keeps its own type, with the same rollback
+            performed and its outcome printed to stderr.
     """
-    staged_json = json_path.with_name(json_path.name + _STAGING_SUFFIX)
-    staged_report = report_path.with_name(report_path.name + _STAGING_SUFFIX)
-    published: list[tuple[pathlib.Path, pathlib.Path | None]] = []
+    # One directory holds the pair: the staging directory is created inside it,
+    # which is what makes publication a rename on the destinations' own
+    # filesystem rather than a copy that could half-succeed.
+    output = json_path.parent
+    if report_path.parent != output:
+        raise _ArtefactError(
+            f"the artefact pair must be written into one directory, but the "
+            f"JSON names {output} and the report names {report_path.parent}"
+        )
+    # Guarded and created before anything else: an output under git metadata, or
+    # a path that exists and is not a directory, is not a place two artefacts
+    # may be written.
+    reason = _unsafe_output_reason(output)
+    if reason is not None:
+        raise _ArtefactError(f"the artefact directory may not be written to: {reason}")
     try:
+        output.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise _ArtefactError(
+            f"the artefact directory {output} could not be created: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    staging_dir = _new_staging_dir(output)
+    handles: list[int] = []
+    unpublished: list[tuple[pathlib.Path, int]] = []
+    published: list[_Replaced] = []
+    try:
+        staged_json, json_handle = _new_staging_file(staging_dir, _STAGING_PREFIX)
+        handles.append(json_handle)
+        unpublished.append((staged_json, json_handle))
+        staged_report, report_handle = _new_staging_file(staging_dir, _STAGING_PREFIX)
+        handles.append(report_handle)
+        unpublished.append((staged_report, report_handle))
         try:
             write_json(staged_json, payload)
             write_report(staged_report, payload)
@@ -2798,39 +4513,114 @@ def _write_artefact_pair(
             # the committed pair untouched and say why, rather than surface as a
             # traceback from between the two writes.
             raise _ArtefactError(
-                f"the artefact pair could not be staged in {json_path.parent}: "
+                f"the artefact pair could not be staged in {output}: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
+        for staged, handle in (
+            (staged_json, json_handle),
+            (staged_report, report_handle),
+        ):
+            # Before validation, not after it: contents written into a path that
+            # was swapped for a symbolic link or another file are not this run's
+            # artefact and must not be validated, let alone published.
+            _verify_staged_identity(staged, handle)
+            try:
+                # On the descriptor, which follows no link by construction. A
+                # staging file is created 0600 and a committed artefact is
+                # world-readable, so the mode is set here rather than published.
+                os.fchmod(handle, _ARTEFACT_MODE)
+            except OSError as exc:
+                raise _ArtefactError(
+                    f"the staged artefact {staged} could not be given the "
+                    f"artefacts' mode {_ARTEFACT_MODE:04o}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
         _validate_staged_json(staged_json, payload)
         _validate_staged_report(staged_report, payload)
         try:
-            for staged, destination in (
-                (staged_json, json_path),
-                (staged_report, report_path),
+            for staged, handle, destination in (
+                (staged_json, json_handle, json_path),
+                (staged_report, report_handle, report_path),
             ):
-                published.append((destination, _publish_artefact(staged, destination)))
-        except OSError as exc:
-            # Roll the pair back in reverse order, so neither destination is
-            # left holding this run's output next to the previous run's.
-            for destination, backup in reversed(published):
-                _unpublish_artefact(destination, backup)
-            raise _ArtefactError(
-                f"the staged artefacts could not replace the committed pair in "
-                f"{json_path.parent}, which was left as it was: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
+                # Again here, immediately before the rename: validation read the
+                # path, and a path replaced between that read and this move
+                # would otherwise be the file that gets published.
+                _verify_staged_identity(staged, handle)
+                published.append(_publish_artefact(staged, destination))
+                # Published means renamed away: the staging name no longer names
+                # this run's file, so cleanup must not touch it.
+                unpublished.remove((staged, handle))
+        except BaseException as exc:
+            # Deliberately BaseException: a mixed pair is the one outcome this
+            # function exists to prevent, so every way publication can stop --
+            # a failed rename, a refused destination, a digest that could not be
+            # taken, an interrupt between the two moves -- rolls the pair back
+            # and reports what that achieved instead of assuming it.
+            rollback = _roll_back_published(published)
+            if isinstance(exc, Exception):
+                raise _ArtefactError(
+                    f"the artefact pair could not be published in "
+                    f"{output}: {type(exc).__name__}: {exc}. "
+                    f"Rollback: {rollback}."
+                ) from exc
+            # An interrupt or a SystemExit keeps its own type, so the rollback
+            # outcome is printed rather than lost with it.
+            print(
+                f"the artefact pair was rolled back after "
+                f"{type(exc).__name__}: {rollback}.",
+                file=sys.stderr,
+            )
+            raise
+        for record in published:
+            # The whole pair published, so no set-aside copy is needed to undo
+            # anything any more. This is the only path on which one is removed.
+            if record.backup is None:
+                continue
+            try:
+                record.backup.unlink()
+            except OSError as exc:
+                print(
+                    f"warning: the previous {record.destination} was published "
+                    f"over successfully, but the copy it was set aside in "
+                    f"({record.backup}) could not be removed "
+                    f"({type(exc).__name__}: {exc}); remove it by hand, as the "
+                    f"next run's dirty check will report it",
+                    file=sys.stderr,
+                )
     finally:
-        # Neither a staging file nor a set-aside copy that cannot be removed may
-        # mask the failure being raised; both are visible to the next run's
-        # dirty check anyway.
-        for leftover in (
-            staged_json,
-            staged_report,
-            json_path.with_name(json_path.name + _BACKUP_SUFFIX),
-            report_path.with_name(report_path.name + _BACKUP_SUFFIX),
-        ):
+        # Only files this process created through ``_new_staging_file`` and never
+        # published are removed, and only while the name still identifies the
+        # file it was created as -- anything else is an entry this run did not
+        # make, which is reported and left where it is. A removal that fails may
+        # not mask the failure being raised. Descriptors are closed last: while
+        # one is open the staging inode cannot be recycled under its name.
+        for path, handle in unpublished:
+            if _names_descriptor(path, handle):
+                with contextlib.suppress(OSError):
+                    path.unlink(missing_ok=True)
+            elif os.path.lexists(path):
+                print(
+                    f"warning: the staging path {path} no longer names the file "
+                    f"this run created there, so it is left in place rather "
+                    f"than removed; inspect and remove it by hand",
+                    file=sys.stderr,
+                )
+        for handle in handles:
+            # A close that fails cannot change what is on disk, and the artefact
+            # outcome is already decided by here.
             with contextlib.suppress(OSError):
-                leftover.unlink(missing_ok=True)
+                os.close(handle)
+        try:
+            staging_dir.rmdir()
+        except OSError as exc:
+            # Only ever empty by here unless something this run did not create
+            # is inside it, which the loop above has already named.
+            print(
+                f"warning: the staging directory {staging_dir} could not be "
+                f"removed ({type(exc).__name__}: {exc}); remove it by hand, as "
+                f"the next run's dirty check will report it",
+                file=sys.stderr,
+            )
 
 
 def _resolve_output(value: str | None) -> pathlib.Path:
@@ -2841,6 +4631,9 @@ def _resolve_output(value: str | None) -> pathlib.Path:
     however the runner was started. An explicit ``--output`` is resolved against
     the working directory, which is what makes ``--output /tmp/...`` -- the A/A
     calibration idiom that keeps the tree clean -- behave as written.
+
+    Args:
+        value: The ``--output`` argument, or ``None`` for the default directory.
     """
     if value is None:
         return _repository_root() / _DEFAULT_OUTPUT
@@ -2870,17 +4663,25 @@ def _dirty_tree_refusal(
 ) -> tuple[str, ...] | None:
     """Return the reasons artefacts must not be written, or ``None`` if they may.
 
-    Writing inside the repository is refused unless the tree is provably clean,
-    because a committed artefact has to describe an identifiable commit: the
-    ``git HEAD`` it records would otherwise not be the code that was measured.
-    Two conditions refuse, not one. A dirty tree is the obvious one. The other is
-    a tree whose state could not be established at all -- no git executable, a
-    directory that is not this repository, a failed ``git status`` -- because
-    "unknown" is not "clean", and treating it as clean is precisely how an
-    artefact acquires a ``dirty=false`` flag that nothing ever checked.
+    This is the provenance refusal and only that, because it is the refusal the
+    run reports as status 3. Writing inside the repository is refused unless the
+    tree is provably clean, because a committed artefact has to describe an
+    identifiable commit: the ``git HEAD`` it records would otherwise not be the
+    code that was measured. Two conditions refuse, not one. A dirty tree is the
+    obvious one. The other is a tree whose state could not be established at
+    all -- no git executable, a directory that is not this repository, a failed
+    ``git status`` -- because "unknown" is not "clean", and treating it as clean
+    is precisely how an artefact acquires a ``dirty=false`` flag that nothing
+    ever checked.
 
-    Writing into a directory outside the checkout is always allowed -- that is how
-    the A/A calibration run happens before the first commit without dirtying
+    An output location that may not be written to at all -- git metadata, or a
+    path that exists and is not a directory -- is a different failure and is not
+    reported here: :func:`_write_artefact_pair` refuses it as an artefact
+    failure, which is status 1, so that status 3 keeps meaning what the exit
+    codes say it means.
+
+    Writing into a directory outside the checkout is not refused here -- that is
+    how the A/A calibration run happens before the first commit without dirtying
     anything, and such output is not committed evidence.
 
     Args:
@@ -2934,17 +4735,18 @@ def _provenance_drift(
             f"{before.delayed_py_sha256} to {after.delayed_py_sha256} during the "
             "run, so the measured code is not the code on disk"
         )
-    if after.dirty:
-        drift.extend(
-            f"the working tree became dirty during the run: {line}"
-            for line in after.dirty_paths
-        )
+    # Only a path that was clean at start-up counts as drift: a tree that was
+    # already dirty -- the A/A calibration idiom, writing outside the checkout --
+    # has not changed between the two readings.
+    drift.extend(
+        f"the working tree became dirty during the run: {line}"
+        for line in after.dirty_paths
+        if line not in before.dirty_paths
+    )
     return tuple(drift)
 
 
-# ---------------------------------------------------------------------------
 # The gate, its checklist and the command line
-# ---------------------------------------------------------------------------
 
 #: Artefact file names. They are part of the parsing contract of
 #: ``dask/tests/test_delayed_ab_gate.py``.
@@ -2969,14 +4771,22 @@ _CHECK_RELATIONS = {
 
 
 def _format_measurement(value: float) -> str:
-    """Render a measured value: whole numbers stay whole, ratios get decimals."""
+    """Render a measured value: whole numbers stay whole, ratios get decimals.
+
+    Args:
+        value: The checklist item's measured value.
+    """
     if float(value).is_integer():
         return str(int(value))
     return f"{value:.3f}"
 
 
 def _check_relation(name: str) -> str:
-    """Return the relation a checklist item asserts, by item name."""
+    """Return the relation a checklist item asserts, by item name.
+
+    Args:
+        name: The item's name, as the JSON records it.
+    """
     for prefix, relation in _CHECK_RELATIONS.items():
         if name == prefix or name.startswith(f"{prefix}_"):
             return relation
@@ -3206,6 +5016,9 @@ def _print_checklist(payload: dict[str, Any]) -> None:
 
     Each item carries its measured value next to the threshold it had to reach,
     and a failing case names the thresholds it missed and by how much.
+
+    Args:
+        payload: The run payload the checklist and verdicts are read from.
     """
     print()
     print("Gate checklist:")
@@ -3270,8 +5083,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=_DEFAULT_ROUNDS,
         metavar="N",
         help=(
-            f"measured rounds per case, at least {_MIN_ROUNDS} "
-            f"(default: {_DEFAULT_ROUNDS})"
+            f"measured rounds per case, at least {_MIN_ROUNDS} and at most "
+            f"{_MAX_ROUNDS} (default: {_DEFAULT_ROUNDS})"
         ),
     )
     parser.add_argument(
@@ -3280,8 +5093,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=_DEFAULT_WARMUP,
         metavar="N",
         help=(
-            f"discarded warmup rounds per case, at least {_MIN_WARMUP} "
-            f"(default: {_DEFAULT_WARMUP})"
+            f"discarded warmup rounds per case, at least {_MIN_WARMUP} and at "
+            f"most {_MAX_ROUNDS} (default: {_DEFAULT_WARMUP})"
         ),
     )
     parser.add_argument(
@@ -3372,9 +5185,10 @@ def _prepare_run(
     """Configure and vet the run before any measurement is taken.
 
     Everything that can invalidate a whole run is settled here, in the order
-    that costs least: the calibration file, then the two arms, then arm A's
-    provenance, then the working tree. Each is a precondition of the next, and
-    all of them precede the minutes of measurement -- a run that cannot produce
+    that costs least: the calibration file, then arm A's provenance, then the two
+    arms -- arm A's capture is judged before it is imported, since importing it
+    runs it -- then the working tree. Each is a precondition of the next, and all
+    of them precede the minutes of measurement: a run that cannot produce
     trustworthy evidence should not spend that time first.
 
     Args:
@@ -3397,13 +5211,13 @@ def _prepare_run(
         return _EXIT_GATE_FAIL
 
     try:
-        baseline, live = load_arms()
-        # Arm A's provenance is a precondition of every ratio this run reports,
-        # so it is verified here: before equivalence, before any timing.
+        # Arm A is judged before it is imported: importing the capture executes
+        # its top-level code, and a capture that is not the frozen source has to
+        # be rejected while it is still inert. ``load_arms`` repeats the byte
+        # check at the import itself and verifies the imported module's origin.
         _baseline_arm()
+        baseline, live = load_arms()
     except (_ArmLoadError, _ProvenanceError) as exc:
-        # Halt and report: neither the capture nor any frozen dask module is
-        # edited to make this work.
         print(f"halt: {exc}", file=sys.stderr)
         return _EXIT_GATE_FAIL
 

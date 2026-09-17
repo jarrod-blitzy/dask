@@ -74,7 +74,7 @@ def _get_partial(key, dct, default):
     return dct.get(key, default)
 
 
-def _finalize_args_collections(args, collections, *, _cull=cull):
+def _finalize_args_collections(args, collections):
     old_keys = [c.__dask_keys__()[0] for c in collections]
     collections = _ExprSequence(*collections).optimize()
     new_keys = collections.__dask_keys__()
@@ -97,7 +97,7 @@ def _finalize_args_collections(args, collections, *, _cull=cull):
         hlg = HighLevelGraph(
             {
                 k[0]: MaterializedLayer(
-                    _cull(dsk, [k[0]]),
+                    cull(dsk, [k[0]]),
                     annotations=layer_annotations,
                 )
             },
@@ -108,13 +108,6 @@ def _finalize_args_collections(args, collections, *, _cull=cull):
     subs = {old: new[0] for old, new in zip(old_keys, new_keys) if old != new}
     args = args.substitute(subs)
     return args, collections
-
-
-# ``cull`` is bound into ``_finalize_args_collections`` above as a keyword-only
-# default, so hoisting it out of that function's body - it used to be imported on
-# every call - costs this module no name of its own. The binding is what keeps the
-# callable alive; nothing else in the file uses it.
-del cull
 
 
 # Iterator types and the container types ``unpack_collections`` dispatches on are
@@ -131,21 +124,20 @@ _SEQUENCE_TYPES: tuple[type, ...] = (list, tuple, set)
 
 
 def _leaf_layer_dict(leaf: DelayedLeaf) -> Graph:
-    """Return the single-node layer mapping of a ``DelayedLeaf``.
+    """Return the one-entry layer mapping of a ``DelayedLeaf``.
 
-    This is the body of ``DelayedLeaf.dask`` without the ``HighLevelGraph``
-    around it, so that a leaf used as a dependency can contribute its layer to
-    the merged graph directly instead of through an intermediate container.
+    A module-level function rather than a method on purpose: ``Delayed`` and its
+    subclasses are public, so a subclass is free to define a method of any name,
+    and dispatching through one would let it intercept the construction path.
 
-    The mapping always holds exactly one entry, keyed by ``leaf._key``, and its
-    value is part of the frozen graph shape: a wrapped object that is already a
-    ``TaskRef`` or a ``GraphNode`` is stored as it is, while any other value is
-    wrapped in ``DataNode(leaf._key, leaf._obj)``.
+    Args:
+        leaf: The leaf whose wrapped object is the layer's single node.
 
-    It is a module-level function rather than a method on purpose: ``Delayed``
-    and its subclasses are public, so a user subclass is free to define a method
-    of any name, and dispatching through one would let the subclass intercept the
-    construction path.
+    Returns:
+        A mapping of exactly one entry, keyed by ``leaf._key``. The value is part
+        of the graph shape: a wrapped object that is already a ``TaskRef`` or a
+        ``GraphNode`` is the value as it is, and any other value is wrapped in
+        ``DataNode(leaf._key, leaf._obj)``.
     """
     obj = leaf._obj
     if isinstance(obj, (TaskRef, GraphNode)):
@@ -158,53 +150,45 @@ def _graph_from_collections(
 ) -> HighLevelGraph:
     """Build the ``HighLevelGraph`` of a new node from its dependencies.
 
-    Equivalent to ``HighLevelGraph.from_collections(name, layer, collections)``
-    for the ``Delayed`` family, but without the per-dependency
-    ``is_dask_collection`` probe (which reads ``x.expr``, thereby constructing a
-    throw-away ``DelayedAttr`` and running a full ``tokenize``), without the
-    duplicated ``__dask_graph__()`` call, and without materialising an
-    intermediate container for a ``DelayedLeaf`` dependency.
+    Produces what ``HighLevelGraph.from_collections(name, layer, collections)``
+    produces for the ``Delayed`` family: the same class, the same layers, the
+    same dependencies and the same dict *insertion order* - existing-then-new for
+    a single ``HighLevelGraph``-backed dependency, new-then-existing for a single
+    ``dict``-backed one and for several dependencies. Insertion order is part of
+    the contract because ``tokenize`` hashes the pickled state of a ``Delayed``.
+    The public ``HighLevelGraph`` constructor always has the last word, so the
+    container keeps ownership of its own invariants.
 
-    The result is the same class with the same layers, the same dependencies and
-    - because ``tokenize`` hashes the pickled state of a ``Delayed`` - the same
-    dict *insertion order* as ``HighLevelGraph.from_collections`` produces:
-    existing-then-new for a single ``HighLevelGraph``-backed dependency,
-    new-then-existing for a single ``dict``-backed one and for several
-    dependencies. The public ``HighLevelGraph`` constructor always has the last
-    word, so the container keeps ownership of its own invariants.
+    A dependency is merged directly only when it is exactly a ``Delayed``,
+    ``DelayedLeaf`` or ``DelayedAttr`` (never a subclass); when an exact
+    ``Delayed`` carries exactly a ``HighLevelGraph`` or exactly a ``dict`` (any
+    other ``Mapping``, such as ``types.MappingProxyType``, does not qualify); and
+    when its key *and* its layer name are recursively builtin - exactly ``str``,
+    ``bytes``, ``int``, ``float``, ``bool`` or ``None``, or exactly a ``tuple`` of
+    such values. A ``DelayedAttr`` merges its parent's graph into its own,
+    recursively, so the same test applies to every ancestor reachable through
+    ``_obj``. One dependency, or one ancestor, that fails the test sends the whole
+    call to ``HighLevelGraph.from_collections``, whose side effects a caller can
+    count: it ``repr()``s a key that is not builtin, through the ``tokenize`` of
+    its ``is_dask_collection`` probe, and hashes a layer name that is not builtin
+    while merging. The guard therefore completes before any output dictionary is
+    built and before any lazy ``dask`` property is read, so a call that falls back
+    reproduces the generic path exactly.
 
-    The shortcut is taken only for a dependency that is *safe*, meaning: exactly
-    a ``Delayed``, ``DelayedLeaf`` or ``DelayedAttr`` (never a subclass); for an
-    exact ``Delayed``, carrying exactly a ``HighLevelGraph`` or exactly a
-    ``dict`` (any other ``Mapping``, e.g. ``types.MappingProxyType``, is not
-    safe); and with a key *and* a layer name that are recursively builtin. A
-    ``DelayedAttr`` merges its parent's graph into its own, recursively, so the
-    same test is applied to every ancestor reachable through ``_obj``: today's
-    doubled probe-and-merge builds an attribute's graph twice per level, which
-    ``repr()``s and hashes an unsafe ancestor's key and layer name a number of
-    times the shortcut would not reproduce. Any dependency - or any ancestor of
-    one - that fails the test sends the **whole call** to
-    ``HighLevelGraph.from_collections``, so that every side effect stays exactly
-    as it is today.
+    Args:
+        name: Key and layer name of the new node - any key object, exactly as
+            ``HighLevelGraph.from_collections`` accepts (its own annotation says
+            ``str``, which is why the fallback call below carries an ignore).
+        layer: The new node's layer mapping, ``{name: task}``.
+        collections: The dependencies, as any sized iterable:
+            ``unpack_collections`` passes a tuple, ``call_function`` a list,
+            ``DelayedAttr.dask`` a one-tuple and the ``traverse=False`` path of
+            ``delayed`` an empty ``set``. Duplicates are allowed and are merged
+            once, in order of first appearance.
 
-    An exact ``Delayed``'s stored graph is read **once**, by the guard, and the
-    merge reuses that very object; a ``DelayedLeaf`` contributes its layer
-    mapping directly and a ``DelayedAttr``'s lazy graph is built in the merge, so
-    that no lazy property runs for a call that ends up falling back.
-
-    Parameters
-    ----------
-    name :
-        Key and layer name of the new node - any key object, exactly as
-        ``HighLevelGraph.from_collections`` accepts (its own annotation says
-        ``str``, which is why the fallback call below carries an ignore).
-    layer :
-        The new node's layer mapping, ``{name: task}``.
-    collections :
-        The dependencies, as any sized iterable: ``unpack_collections`` passes a
-        tuple, ``call_function`` a list, ``DelayedAttr.dask`` a one-tuple and the
-        ``traverse=False`` path of ``delayed`` an empty ``set``. Duplicates are
-        allowed and are merged once.
+    Returns:
+        The new node's ``HighLevelGraph``: every dependency's layers and
+        dependencies merged with ``layer`` under ``name``.
     """
     # Both dicts are keyed by layer name and hold whatever layer mapping their
     # source carries - a raw mapping here, an already-wrapped ``Layer`` when it
@@ -233,12 +217,12 @@ def _graph_from_collections(
         # first position, and the object it maps to is the same either way.
         dependencies = list({id(c): c for c in collections}.values())
 
-    # Guard pass. It completes before a single dict is built, so a failure late
-    # in the list cannot leave half-merged state behind, and so that no lazy
-    # ``dask`` property is evaluated for a call that ends up falling back.
-    # ``graphs`` holds, per dependency, the graph read here and reused by the
-    # merge, or ``None`` where the merge produces the layer itself (a leaf) or
-    # has to build it lazily (an attribute).
+    # Guard pass. It completes before either output dictionary - ``layers`` or
+    # ``deps`` - is built, so a dependency that fails late cannot leave
+    # half-merged state behind, and no lazy ``dask`` property is evaluated for a
+    # call that ends up falling back. ``graphs`` holds, per dependency, the graph
+    # read here and reused by the merge, or ``None`` where the merge produces the
+    # layer itself (a leaf) or has to build it lazily (an attribute).
     graphs: list = []
     shortcut = True
     for collection in dependencies:
@@ -256,8 +240,6 @@ def _graph_from_collections(
                     shortcut = False
                     break
                 if candidate is collection:
-                    # The one read of this dependency's graph; the merge below
-                    # takes this object rather than reading the property again.
                     stored = candidate_graph
             elif typ is not DelayedLeaf and typ is not DelayedAttr:
                 shortcut = False
@@ -306,14 +288,9 @@ def _graph_from_collections(
             candidate = candidate._obj
             depth += 1
             if depth > 64:
-                # ``_obj`` is a declared slot, so a caller may assign to it and
-                # build a cyclic chain. The walk is bounded so that such a chain
-                # takes the generic path - which recurses through
-                # ``is_dask_collection`` and raises ``RecursionError`` exactly as
-                # it does today - instead of spinning here. The bound is far
-                # beyond any chain the generic path could finish anyway: it
-                # rebuilds an attribute's graph twice per level, so its cost
-                # doubles with every attribute in the chain.
+                # ``_obj`` is a declared slot, so a caller can assign to it and
+                # build a cyclic chain. Bounding the walk sends such a chain down
+                # the generic path rather than looping here.
                 shortcut = False
                 break
         if not shortcut:
@@ -336,13 +313,9 @@ def _graph_from_collections(
         (graph,) = graphs
         if graph is None:
             if type(collection) is DelayedLeaf:
-                # The leaf's own ``dask`` property is not read, so the
-                # intermediate ``HighLevelGraph`` it would build never exists.
                 layers = {collection._key: _leaf_layer_dict(collection), name: layer}
                 deps = {collection._key: set(), name: {collection._layer}}
                 return HighLevelGraph(layers, deps)
-            # An attribute builds its own graph, which is always a
-            # ``HighLevelGraph``.
             graph = collection.dask
         if type(graph) is HighLevelGraph:
             layers = ensure_dict(graph.layers, copy=True)
@@ -436,6 +409,29 @@ def unpack_collections(expr, _return_collections=True):
     >>> collections
     (Delayed('a'), Delayed('b'))
     """
+    typ = type(expr)
+
+    # Fast path for the builtin scalars that can match none of the branches below
+    # and therefore always fall through to ``return expr, ()``. The dispatch is by
+    # exact-type identity only - never ``isinstance``, never a set or dict
+    # membership test - so it runs no user code at all and leaves ``typ in
+    # _SEQUENCE_TYPES`` below as the first and only place the traversal compares a
+    # type object. An exact type also settles the two probes it skips: a value of
+    # exactly one of these types is never a ``Delayed``, and it can never be a dask
+    # collection either, because a built-in type cannot acquire a
+    # ``__dask_graph__`` attribute. A subclass of, say, ``int`` matches no identity
+    # test here and takes the full cascade.
+    if (
+        expr is None
+        or typ is int
+        or typ is str
+        or typ is float
+        or typ is bool
+        or typ is bytes
+        or typ is complex
+    ):
+        return expr, ()
+
     if isinstance(expr, Delayed):
         if _return_collections:
             return TaskRef(expr._key), (expr,)
@@ -467,26 +463,6 @@ def unpack_collections(expr, _return_collections=True):
             (name,) = expr.__dask_keys__()
             return TaskRef(name), (expr,)
 
-    typ = type(expr)
-
-    # Fast path for the builtin scalars that can match none of the branches
-    # below and therefore always fall through to ``return expr, ()``. The
-    # dispatch is by exact-type identity only - never ``isinstance``, never a
-    # set or dict membership test - so it runs no user code at all and leaves
-    # ``typ in _SEQUENCE_TYPES`` below as the first and only place the traversal
-    # compares a type object. An exact-type test also means a subclass of, say,
-    # ``int`` still takes the full cascade, exactly as it does today.
-    if (
-        expr is None
-        or typ is int
-        or typ is str
-        or typ is float
-        or typ is bool
-        or typ is bytes
-        or typ is complex
-    ):
-        return expr, ()
-
     # Iterators are materialized into the container they iterate over. ``typ``
     # is read once above, so each coercion has to update it too.
     if typ is _LIST_ITER_TYPE:
@@ -500,39 +476,34 @@ def unpack_collections(expr, _return_collections=True):
         typ = set
 
     if typ in _SEQUENCE_TYPES:
-        # One traversal per element, appending each element's task and collecting
-        # its collections, instead of ``unzip`` over a generator of pairs
-        # followed by ``unique(concat(...), key=id)`` over the collections.
         args: list = []
         collections: list = []
         # Bound once rather than looked up per element: this loop runs for every
         # element of every container the traversal reaches.
         append_arg = args.append
         extend_collections = collections.extend
+        # ``verbatim`` stays true while every element comes back from the
+        # recursion as the object that went in and is itself no node, which is
+        # the condition under which the ``List`` built below carries no
+        # ``dependencies``: they can only come from a ``TaskRef`` or a
+        # ``GraphNode`` among its arguments. The branch then returns ``expr``
+        # itself, so the pair is the same whether or not the node was built
+        # first. ``len(args) != 1`` is what keeps that reasoning sound: a lone
+        # argument is the one case ``NestedContainer.__init__`` unwraps when it
+        # is a ``list`` instance, and unwrapping scans the *contents* of an
+        # element the exact-type dispatch left atomic - a ``list`` subclass
+        # holding a ``TaskRef`` does carry a dependency that way. Every
+        # container with a single element therefore still goes through
+        # ``List(*args)``, and so does every container that reaches a node.
+        verbatim = True
         for e in expr:
-            typ_e = type(e)
-            if (
-                e is None
-                or typ_e is int
-                or typ_e is str
-                or typ_e is float
-                or typ_e is bool
-                or typ_e is bytes
-                or typ_e is complex
-            ):
-                # The scalar fast path above, inlined for one level of recursion:
-                # for these exact types the recursive call can only hand the very
-                # same object back with no collections, and nothing it evaluates
-                # on the way there - ``isinstance(e, Delayed)`` and the
-                # ``hasattr`` probe inside ``is_dask_collection`` - can run user
-                # code for them, so skipping it is unobservable. The container's
-                # ``List`` is still built below, so its ``dependencies`` and every
-                # side effect of constructing it stay exactly as they are today.
-                append_arg(e)
-                continue
             arg, subcollections = unpack_collections(e, _return_collections=False)
+            if arg is not e or isinstance(e, (TaskRef, GraphNode)):
+                verbatim = False
             append_arg(arg)
             extend_collections(subcollections)
+        if verbatim and not collections and len(args) != 1:
+            return expr, ()
         if len(collections) > 1:
             # De-duplicate by identity, first occurrence winning and the order
             # being that of first appearance - exactly ``unique(..., key=id)``.
@@ -1155,16 +1126,14 @@ def call_function(func, func_token, args, kwargs, pure=None, nout=None):
     for arg in args:
         arg_task, subcollections = unpack_collections(arg)
         args2.append(arg_task)
-        if subcollections:
-            collections.extend(subcollections)
+        collections.extend(subcollections)
 
     if kwargs:
         dask_kwargs, kwargs_collections = unpack_collections(kwargs)
         collections.extend(kwargs_collections)
     else:
-        # Unpacking an empty mapping can only ever give the mapping back, so the
-        # two recursive calls and the three nodes they build and discard are
-        # skipped. ``Task`` sees the same empty keyword mapping either way.
+        # An empty mapping needs no traversal: it can only unpack to itself, and
+        # ``Task`` receives the same empty keyword mapping either way.
         dask_kwargs = kwargs
     task = Task(name, func, *args2, **dask_kwargs)
 

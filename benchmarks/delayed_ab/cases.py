@@ -1,50 +1,30 @@
-"""Frozen benchmark corpus for the ``dask.delayed`` A/B performance suite.
+"""Benchmark corpus for the ``dask.delayed`` A/B performance suite.
 
-This module holds the six gated cases and the three informational sub-series that the
-A/B runner (``benchmarks.delayed_ab.main``) measures. It deliberately imports no
-``dask`` at all: every case is *parameterised by the module under test*, which arrives
-as the ``mod`` argument, so the identical Python code path runs against both arms of
-the comparison — the frozen pre-refactor capture
-``benchmarks.delayed_ab.baseline_delayed`` (arm A) and the live ``dask.delayed``
-(arm B). Importing either arm here would hard-wire one of them and defeat the whole
-design.
+This module holds the six gated cases and the three informational sub-series measured
+by ``benchmarks.delayed_ab.main``. Every case is parameterised by the module under
+test, which arrives as the ``mod`` argument, so the identical Python code path runs
+against both arms — the frozen ``benchmarks.delayed_ab.baseline_delayed`` (arm A) and
+the live ``dask.delayed`` (arm B). That is why this module imports no ``dask`` at all:
+importing either arm here would hard-wire one of them.
 
-Each case is a ``Case`` record pairing two callables:
+Each case is a ``Case`` record pairing an untimed ``setup`` with a ``build`` that is
+the timed region and performs graph construction only. ``Case`` documents the full
+contract both callables obey.
 
-* ``setup(mod, *, pure)`` is **untimed**. It builds whatever inputs the case needs
-  using the arm's own module and returns an opaque state object (``None`` when a case
-  needs no inputs). It is called fresh for every timed region, so no region ever
-  inherits another region's warm state.
-* ``build(mod, state, *, pure)`` is **the timed region**. It performs graph
-  construction only and returns the list of constructed ``Delayed`` objects, which the
-  runner uses for its equivalence assertions (keys, canonical graphs, results).
+The case sizes — the module-level ``_*_N`` constants, so every number is auditable in
+one place — and the argument shapes are fixed properties of the corpus: they were
+chosen before any measurement and are never re-tuned against results, so a case that
+misses its threshold stays in the corpus and is reported with its cause named.
 
-Sizes and shapes are frozen by the plan. They were fixed before any measurement was
-taken and may never be resized, dropped or re-parameterised after results are seen: a
-case that fails its threshold stays in the corpus and is reported with its cause
-named. The sizes live in the module-level ``_*_N`` constants so that every number is
-auditable in one place.
-
-The four module-level callables/classes (``f``, ``add``, ``ident`` and ``Obj``) are
-defined *here* rather than in an arm module on purpose. They are tokenized by
-pickle-by-reference, so their tokens embed ``benchmarks.delayed_ab.cases`` — the same
-module path for both arms, which is exactly what makes their deterministic keys
-comparable.
-
-Three constructs are deliberately absent from the corpus: reflected operators,
-iterator arguments and namedtuples. Objects tokenized by pickle-by-reference embed
-their *defining* module path, so ``dask.delayed._swap`` (reflected operators),
-``_reconstruct_namedtuple`` and any ``Delayed`` reached *through* pickle (an iterator
-argument, a user object holding a ``Delayed``) produce legitimately different
-deterministic tokens between ``dask.delayed`` and
-``benchmarks.delayed_ab.baseline_delayed`` even when the two implementations are
-identical. A case using them would fail the runner's exact-key equivalence check for a
-reason that is not a defect, so they are covered instead by
-``dask/tests/test_delayed_equivalence.py`` against the live module.
-
-Timing, garbage-collector control and computation all belong to the runner. Nothing in
-this module reads the clock, touches ``gc``, computes a graph, performs I/O or mutates
-module-level state.
+``f``, ``add``, ``ident`` and ``Obj`` are defined here rather than in an arm module
+because they are tokenized by pickle-by-reference: a corpus-local definition embeds
+the same module path for both arms, which is what makes their deterministic keys
+comparable. For the same reason reflected operators, iterator arguments and
+namedtuples are absent from the corpus — each embeds the arm's own module path
+(``_swap``, ``_reconstruct_namedtuple``, any ``Delayed`` reached *through* pickle), so
+their tokens would differ legitimately between arms even on identical
+implementations. ``dask/tests/test_delayed_equivalence.py`` covers those constructs
+against the live module instead.
 """
 
 from __future__ import annotations
@@ -66,6 +46,9 @@ def f(x: int) -> int:
 
     The single-argument workhorse of the corpus. Defined at module level so it pickles
     by reference and therefore tokenizes identically for both arms.
+
+    Args:
+        x: The integer to increment.
     """
     return x + 1
 
@@ -74,6 +57,10 @@ def add(x: int, y: int) -> int:
     """Return ``x + y``.
 
     Used by the chain and ``pure``-keying cases, which need a two-argument callable.
+
+    Args:
+        x: The first addend.
+        y: The second addend.
     """
     return x + y
 
@@ -84,6 +71,9 @@ def ident(*args: Any) -> tuple[Any, ...]:
     One uniform definition serves both the single nested-container argument of
     ``nested_containers`` and the 5,000-argument fan-in of ``wide_fan_in``, so it has
     to accept varargs and hand the tuple straight back.
+
+    Args:
+        *args: The positional arguments to return unchanged.
     """
     return args
 
@@ -104,17 +94,17 @@ class Obj:
         """Initialise the instance's ``v`` attribute and its ``items`` list.
 
         Args:
-            v: The integer the instance carries. It is stored on ``v``, which
-                ``attr_and_operators`` reads back through the delayed attribute access
-                ``o.v`` and which ``meth`` adds its argument to, and it seeds ``items``
-                with the three consecutive integers ``[v, v + 1, v + 2]`` that the same
-                case indexes as ``o.items[1]``.
+            v: The integer carried on ``v``; ``items`` becomes ``[v, v + 1, v + 2]``.
         """
         self.v = v
         self.items = [v, v + 1, v + 2]
 
     def meth(self, x: int) -> int:
-        """Return ``self.v + x``; the target of the delayed method call."""
+        """Return ``self.v + x``; the target of the delayed method call.
+
+        Args:
+            x: The integer added to ``self.v``.
+        """
         return self.v + x
 
 
@@ -150,9 +140,7 @@ class Case:
     build: BuildFn
 
 
-# ---------------------------------------------------------------------------
-# Case sizes. Frozen by the plan; never tuned against measured results.
-# ---------------------------------------------------------------------------
+# Fixed benchmark sizes.
 _FLAT_LOOP_N = 10_000
 _LINEAR_CHAIN_N = 1_000
 _NESTED_CONTAINERS_N = 200
@@ -168,6 +156,10 @@ def _setup_none(mod: Any, *, pure: bool | None) -> None:
     three sub-series build everything they need inside their timed region, so their
     state is ``None``. The ``Case`` contract asks only for a callable of the setup
     signature; one shared no-op keeps the corpus free of seven identical stubs.
+
+    Args:
+        mod: The module under test. Unused: this setup constructs nothing.
+        pure: Accepted for uniformity with the setup signature and ignored.
     """
     return None
 
@@ -179,6 +171,11 @@ def _build_flat_loop(mod: Any, state: Any, *, pure: bool | None) -> list[Any]:
     re-evaluated on every iteration rather than hoisted out of the loop: per-iteration
     re-wrapping is part of this case's definition, and it is what exercises the wrap
     path (``delayed`` -> ``DelayedLeaf``) once per constructed node.
+
+    Args:
+        mod: The module under test; every wrap and call goes through ``mod.delayed``.
+        state: Unused — this case's setup is ``_setup_none``.
+        pure: Threaded into every ``mod.delayed`` call of the loop.
     """
     return [mod.delayed(f, pure=pure)(i) for i in range(_FLAT_LOOP_N)]
 
@@ -189,6 +186,11 @@ def _build_linear_chain(mod: Any, state: Any, *, pure: bool | None) -> list[Any]
     The whole chain is the timed region. Only the final node is returned: its graph
     transitively contains all 1,000 layers, so equivalence over it covers the whole
     chain and computing it evaluates every node.
+
+    Args:
+        mod: The module under test; every node is built through ``mod.delayed``.
+        state: Unused — this case's setup is ``_setup_none``.
+        pure: Threaded into every ``mod.delayed`` call of the chain.
     """
     x = mod.delayed(f, pure=pure)(0)
     for i in range(1, _LINEAR_CHAIN_N):
@@ -202,12 +204,17 @@ def _build_nested_containers(mod: Any, state: Any, *, pure: bool | None) -> list
     The three leaves are built *inside* the timed region on purpose: the case measures
     leaf construction together with the container recursion it drives.
 
-    The argument builder is reproduced verbatim from the plan and is not tunable. Per
-    call it is exactly 9 ``Delayed`` references to 3 distinct leaves and 12 containers
-    across six nesting levels, with ``lit`` reused four times, so every
-    ``unpack_collections`` container branch — list, tuple, dict, literal-only and mixed
-    — is exercised on every call. The shape was selected by that branch-coverage and
-    recursion-depth criterion before any measurement was taken.
+    The argument builder is fixed and not tunable. Per call it is exactly 9 ``Delayed``
+    references to 3 distinct leaves and 12 containers across six nesting levels, with
+    ``lit`` reused four times, so every ``unpack_collections`` container branch — list,
+    tuple, dict, literal-only and mixed — is exercised on every call. The shape was
+    selected by that branch-coverage and recursion-depth criterion before any
+    measurement was taken.
+
+    Args:
+        mod: The module under test; leaves and calls go through ``mod.delayed``.
+        state: Unused — this case's setup is ``_setup_none``.
+        pure: Threaded into the leaf wraps and the 200 container calls.
     """
     objs: list[Any] = []
     for i in range(_NESTED_CONTAINERS_N):
@@ -227,12 +234,23 @@ def _setup_wide_fan_in(mod: Any, *, pure: bool | None) -> list[Any]:
     Keeping the leaves in setup is what lets the timed region isolate a single call
     that carries 5,000 dependencies — the link where the graph container probes every
     dependency while merging it.
+
+    Args:
+        mod: The module under test; every leaf is built through ``mod.delayed``.
+        pure: Threaded into every leaf's ``mod.delayed`` call.
     """
     return [mod.delayed(f, pure=pure)(i) for i in range(_WIDE_FAN_IN_N)]
 
 
 def _build_wide_fan_in(mod: Any, state: Any, *, pure: bool | None) -> list[Any]:
-    """Make the single 5,000-argument call; only this call is timed."""
+    """Make the single 5,000-argument call; only this call is timed.
+
+    Args:
+        mod: The module under test; the call goes through ``mod.delayed``.
+        state: The 5,000 leaves from ``_setup_wide_fan_in``, spread as the call's
+            positional arguments.
+        pure: Threaded into the single ``mod.delayed`` call.
+    """
     return [mod.delayed(ident, pure=pure)(*state)]
 
 
@@ -242,6 +260,11 @@ def _pure_vs_impure_half(mod: Any, p: bool) -> list[Any]:
     Both halves of ``pure_vs_impure`` and both ``pure_true``/``pure_false`` sub-series
     go through this one helper, so the workloads they compare are provably identical
     apart from the ``p`` they pin.
+
+    Args:
+        mod: The module under test; both levels are built through ``mod.delayed``.
+        p: The ``pure`` value this half pins — ``True`` for deterministic keys,
+            ``False`` for UUID keys.
     """
     return [
         mod.delayed(add, pure=p)(mod.delayed(f, pure=p)(i), i)
@@ -256,6 +279,11 @@ def _build_pure_vs_impure(mod: Any, state: Any, *, pure: bool | None) -> list[An
     does **not** vary with the ``pure`` parameter, which it accepts only for uniformity
     with the rest of the corpus: contrasting the two keying modes over an identical
     workload is the entire point of the case.
+
+    Args:
+        mod: The module under test, passed to both halves.
+        state: Unused — this case's setup is ``_setup_none``.
+        pure: Accepted for uniformity and ignored; each half pins its own ``p``.
     """
     return _pure_vs_impure_half(mod, True) + _pure_vs_impure_half(mod, False)
 
@@ -266,6 +294,10 @@ def _setup_attr_and_operators(mod: Any, *, pure: bool | None) -> tuple[Any, Any]
     Both are wrapped with ``pure=True`` regardless of the variant under test, so the
     timed region starts from a fixed pair: ``o`` is a ``DelayedLeaf`` over the object
     and ``a`` is an ordinary one-argument call.
+
+    Args:
+        mod: The module under test; both wraps go through ``mod.delayed``.
+        pure: Accepted for uniformity and ignored; both wraps pin ``pure=True``.
     """
     return mod.delayed(Obj(3), pure=True), mod.delayed(f, pure=True)(1)
 
@@ -281,6 +313,12 @@ def _build_attr_and_operators(mod: Any, state: Any, *, pure: bool | None) -> lis
     through ``DelayedAttr.__call__``. Only left-associative binary operators, unary
     operators, comparisons and ``getitem`` appear: reflected operators are excluded
     from the corpus because their ``_swap`` partial tokenizes by its defining module.
+
+    Args:
+        mod: The module under test. Unused: every construction here starts from the
+            two objects ``setup`` already wrapped with the arm's own module.
+        state: The ``(o, a)`` pair from ``_setup_attr_and_operators``.
+        pure: Threaded into the delayed method call ``o.meth(i, pure=pure)``.
     """
     o, a = state
     objs: list[Any] = []
@@ -293,7 +331,7 @@ def _build_attr_and_operators(mod: Any, state: Any, *, pure: bool | None) -> lis
     return objs
 
 
-#: The six gated cases, in gate order. Exactly six — the minimum and the maximum.
+#: Gated cases in gate order.
 CASES: tuple[Case, ...] = (
     Case(name="flat_loop", setup=_setup_none, build=_build_flat_loop),
     Case(name="linear_chain", setup=_setup_none, build=_build_linear_chain),
@@ -320,6 +358,11 @@ def _build_nested_containers_shallow(
     depth/branch-coverage criterion the gated shape was selected by. It exists
     precisely to show what such a shape measures, so it is informational only and must
     never be promoted into ``CASES``.
+
+    Args:
+        mod: The module under test; leaves and calls go through ``mod.delayed``.
+        state: Unused — this sub-series' setup is ``_setup_none``.
+        pure: Threaded into the leaf wraps and the 200 container calls.
     """
     objs: list[Any] = []
     for i in range(_NESTED_CONTAINERS_N):
@@ -335,12 +378,24 @@ def _build_nested_containers_shallow(
 
 
 def _build_pure_true(mod: Any, state: Any, *, pure: bool | None) -> list[Any]:
-    """Run the deterministic half of the ``pure``-keying workload on its own."""
+    """Run the deterministic half of the ``pure``-keying workload on its own.
+
+    Args:
+        mod: The module under test, passed to the shared half helper.
+        state: Unused — this sub-series' setup is ``_setup_none``.
+        pure: Accepted for uniformity and ignored; the half pins ``p=True``.
+    """
     return _pure_vs_impure_half(mod, True)
 
 
 def _build_pure_false(mod: Any, state: Any, *, pure: bool | None) -> list[Any]:
-    """Run the UUID-keyed half of the ``pure``-keying workload on its own."""
+    """Run the UUID-keyed half of the ``pure``-keying workload on its own.
+
+    Args:
+        mod: The module under test, passed to the shared half helper.
+        state: Unused — this sub-series' setup is ``_setup_none``.
+        pure: Accepted for uniformity and ignored; the half pins ``p=False``.
+    """
     return _pure_vs_impure_half(mod, False)
 
 

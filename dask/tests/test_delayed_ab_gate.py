@@ -41,6 +41,7 @@ Notes:
     invented. This module performs no timing, statistics, bootstrap or
     allocation measurement of its own -- it launches the harness and reads what
     the harness wrote -- and it imports nothing from ``dask`` or ``benchmarks``.
+
 """
 
 from __future__ import annotations
@@ -83,11 +84,8 @@ _WARMUP = 2
 #: Subprocess timeout in seconds. The project runs pytest with ``timeout = 300``
 #: and ``timeout_method = "thread"``, and a thread-method timeout kills the whole
 #: suite rather than the offending test -- so the subprocess has to fail cleanly
-#: first, and this value is deliberately well below 300. Measured reference: the
-#: reduced run of ``--rounds 7 --warmup 2`` over the nine cases and sub-series
-#: takes a little over three minutes on a twelve-core container, so a run that
-#: reaches this limit is a stuck or a badly contended one, and it is reported as
-#: a failed test rather than as a hung suite.
+#: first, which is why this value stays well below 300. Reaching it is reported
+#: as a failed test rather than as a hung suite.
 _TIMEOUT_SECONDS = 240
 
 #: Trailing lines of each captured stream a failure message reproduces. A gate
@@ -101,7 +99,6 @@ _EXIT_GATE_FAIL = 1
 _EXIT_EQUIVALENCE = 2
 _EXIT_DIRTY = 3
 
-#: The verdict string ``_build_payload`` writes when every gate item held.
 _PASS_VERDICT = "PASS"
 
 #: The gate's thresholds, as fixed before any measurement was taken. They are
@@ -151,6 +148,7 @@ def _repository_root() -> Path:
         Failed: Via :func:`pytest.fail`, when the resolved directory does not
             contain the harness entry point -- the gate cannot run from a
             checkout whose layout it does not recognise.
+
     """
     root = Path(__file__).resolve().parents[2]
     if not (root / _HARNESS_ENTRY_POINT).is_file():
@@ -163,18 +161,6 @@ def _repository_root() -> Path:
 
 
 def _tail(stream: object, *, lines: int = _OUTPUT_TAIL_LINES) -> str:
-    """Render the last ``lines`` lines of a captured stream, bounded and labelled.
-
-    Args:
-        stream: The captured text. ``None`` and non-string values -- which is
-            what a timed-out or crashed subprocess can leave behind -- are
-            rendered as a placeholder rather than raising.
-        lines: How many trailing lines to keep.
-
-    Returns:
-        The trailing lines, prefixed with an elision marker when earlier output
-        was dropped, or a placeholder when nothing was captured.
-    """
     if stream is None:
         return "<not captured>"
     text = stream if isinstance(stream, str) else str(stream)
@@ -190,15 +176,6 @@ def _tail(stream: object, *, lines: int = _OUTPUT_TAIL_LINES) -> str:
 
 
 def _exit_code_hint(returncode: int) -> str:
-    """Explain one of the harness's documented exit codes.
-
-    Args:
-        returncode: The status the subprocess exited with.
-
-    Returns:
-        A one-line diagnosis, so a failure is attributable without re-running
-        anything.
-    """
     if returncode == _EXIT_PASS:
         return "every gate item held"
     if returncode == _EXIT_GATE_FAIL:
@@ -230,18 +207,6 @@ def _harness_report(
     stdout: object,
     stderr: object,
 ) -> str:
-    """Build the diagnostic block every failure message in this module carries.
-
-    Args:
-        command: The argument list the subprocess was started with.
-        returncode: Its exit status, or ``None`` when it never finished.
-        stdout: Captured standard output, if any.
-        stderr: Captured standard error, if any.
-
-    Returns:
-        A readable, bounded block naming the command, the return code and the
-        tail of both streams.
-    """
     status = "<timed out>" if returncode is None else str(returncode)
     return "\n".join(
         [
@@ -262,13 +227,6 @@ def _run_harness(
 ) -> tuple[list[str], subprocess.CompletedProcess[str]]:
     """Run the A/B suite out of process and return the command and its result.
 
-    The suite runs in a subprocess so that pytest's imports, its assertion
-    rewriting and its warnings filters stay out of the timed regions, and so
-    that ``PYTHONHASHSEED`` can be pinned for the measurement without the
-    runner having to re-execute itself: hash randomisation changes dict and set
-    iteration order, which changes how much work the construction path does
-    over containers, so both arms must run under one fixed seed.
-
     Args:
         output_dir: Directory the harness writes its two artefacts into. Always
             pytest's ``tmp_path``, so a gate run never overwrites the committed
@@ -280,6 +238,7 @@ def _run_harness(
     Raises:
         Failed: Via :func:`pytest.fail`, when the subprocess does not finish
             within :data:`_TIMEOUT_SECONDS`.
+
     """
     root = _repository_root()
     command = [
@@ -317,19 +276,6 @@ def _run_harness(
 
 
 def _read_payload(output_dir: Path, report: str) -> dict[str, Any]:
-    """Read and validate the run's JSON artefact.
-
-    Args:
-        output_dir: The directory passed to ``--output``.
-        report: The harness diagnostic block, carried into every failure.
-
-    Returns:
-        The parsed payload.
-
-    Raises:
-        Failed: Via :func:`pytest.fail`, when the artefact is missing, is not
-            readable, is not JSON, or is not a JSON object.
-    """
     path = output_dir / _JSON_NAME
     if not path.is_file():
         pytest.fail(f"the harness wrote no {_JSON_NAME} into {output_dir}\n{report}")
@@ -345,20 +291,6 @@ def _read_payload(output_dir: Path, report: str) -> dict[str, Any]:
 
 
 def _gated_case(payload: dict[str, Any], name: str, report: str) -> dict[str, Any]:
-    """Return one gated case's record from the payload.
-
-    Args:
-        payload: The parsed JSON payload.
-        name: The gated case's name.
-        report: The harness diagnostic block, carried into every failure.
-
-    Returns:
-        The case's JSON object.
-
-    Raises:
-        Failed: Via :func:`pytest.fail`, when ``cases`` or the case itself is
-            missing or has the wrong shape.
-    """
     cases = payload.get("cases")
     if not isinstance(cases, dict):
         pytest.fail(
@@ -389,6 +321,7 @@ def _number(record: dict[str, Any], key: str, *, what: str, report: str) -> floa
         Failed: Via :func:`pytest.fail`, when the key is absent or does not hold
             a number. ``bool`` is rejected: it is an ``int`` subclass, and a
             boolean in a numeric slot means the schema moved.
+
     """
     value = record.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -409,9 +342,9 @@ def _peak_bytes(case: dict[str, Any], arm: str, *, name: str, report: str) -> fl
     under their own definitions and are never read as a peak block count, which
     ``tracemalloc`` does not expose.
 
-    The figure is read the way the JSON schema names it: each measured figure is a
-    direct key of the ``allocation`` object holding the per-arm map, so this is
-    ``allocation["tracemalloc_peak_bytes"][arm]``.
+    The figure is read the way the JSON schema names it: the ``allocation``
+    object holds one record per arm, each carrying that arm's three figures, so
+    this is ``allocation[arm]["tracemalloc_peak_bytes"]``.
 
     Args:
         case: The case's JSON object.
@@ -425,21 +358,22 @@ def _peak_bytes(case: dict[str, Any], arm: str, *, name: str, report: str) -> fl
     Raises:
         Failed: Via :func:`pytest.fail`, when the allocation record is missing or
             malformed.
+
     """
     allocation = case.get("allocation")
     if not isinstance(allocation, dict):
         pytest.fail(f"case {name!r} has no 'allocation' object\n{report}")
-    peaks = allocation.get("tracemalloc_peak_bytes")
-    if not isinstance(peaks, dict):
+    figures = allocation.get(arm)
+    if not isinstance(figures, dict):
         pytest.fail(
-            f"case {name!r} has no 'tracemalloc_peak_bytes' map in its allocation "
-            f"object, found {type(peaks).__name__}. The JSON schema of "
+            f"case {name!r} has no {arm!r} record in its allocation object, found "
+            f"{type(figures).__name__}. The JSON schema of "
             "benchmarks/delayed_ab/main.py has moved and this test must be "
             f"re-read against it.\n{report}"
         )
     return _number(
-        peaks,
-        arm,
+        figures,
+        "tracemalloc_peak_bytes",
         what=f"case {name!r}, arm {arm!r} peak allocation",
         report=report,
     )
@@ -458,6 +392,7 @@ def _verdict_digest(payload: dict[str, Any]) -> str:
     Returns:
         The failed checklist items and the failed per-case thresholds, one per
         line, or a note that neither could be read.
+
     """
     lines: list[str] = []
     gate = payload.get("gate")
@@ -490,23 +425,6 @@ def _verdict_digest(payload: dict[str, Any]) -> str:
     reason="set DASK_DELAYED_AB=1 to run the delayed A/B gate",
 )
 def test_delayed_ab_gate(tmp_path: Path) -> None:
-    """Re-run the A/B suite over reduced rounds and assert the gate's thresholds.
-
-    One test function runs the harness exactly once and asserts every item of
-    the gate against the JSON it wrote: the overall verdict, the paired-ratio
-    and interval floors on ``flat_loop`` and ``nested_containers``, the
-    four-of-six improvement count, the absence of a measured regression, the
-    peak-allocation tolerance, and the equivalence of every case. The
-    informational sub-series are excluded from all of it.
-
-    Args:
-        tmp_path: pytest's per-test directory, used for ``--output`` so that the
-            committed artefacts under ``benchmarks/delayed_ab/results/`` are
-            never touched.
-    """
-    # The sub-series must never be folded into the gated corpus: they carry no
-    # verdict, and counting one towards the improvement item would let an
-    # informational shape stand in for a gated one.
     assert not set(_GATED_CASES) & set(_SUBSERIES_CASES), (
         "the informational sub-series must stay out of the gated case list, "
         f"found {sorted(set(_GATED_CASES) & set(_SUBSERIES_CASES))}"
@@ -544,8 +462,6 @@ def test_delayed_ab_gate(tmp_path: Path) -> None:
         f"{sorted(cases) if isinstance(cases, dict) else type(cases).__name__}\n{report}"
     )
 
-    # The paired-ratio floor and the interval floor, on the two cases that carry
-    # them. Both are read per case so the message names the measured value.
     for name in _RATIO_CASES:
         case = _gated_case(payload, name, report)
         ratio_median = _number(
@@ -563,8 +479,6 @@ def test_delayed_ab_gate(tmp_path: Path) -> None:
             f"noise\n{report}"
         )
 
-    # At least four of the six gated cases must show a real improvement, and no
-    # gated case may show a real regression.
     improved: list[str] = []
     for name in _GATED_CASES:
         case = _gated_case(payload, name, report)
@@ -584,8 +498,6 @@ def test_delayed_ab_gate(tmp_path: Path) -> None:
         f"Improved: {improved or ['none']}\n{report}"
     )
 
-    # Peak allocation: the candidate may not exceed the baseline's tracemalloc
-    # peak bytes by more than the tolerance on any gated case.
     for name in _GATED_CASES:
         case = _gated_case(payload, name, report)
         baseline_peak = _peak_bytes(case, "baseline", name=name, report=report)

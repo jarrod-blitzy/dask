@@ -45,6 +45,7 @@ Notes:
     never re-implemented here: the A/B performance harness and this test have to
     share one definition of "equivalent graph" or the two bodies of evidence can
     drift apart.
+
 """
 
 from __future__ import annotations
@@ -79,24 +80,12 @@ from dask.threaded import get as _threaded_get
 from dask.tokenize import TokenizationError
 from dask.utils_test import inc
 
-# The single canonicaliser shared with the A/B harness
-# (``benchmarks/delayed_ab/canon.py``). This module and ``benchmarks.delayed_ab.main``
-# bind the very same ``sys.modules["benchmarks.delayed_ab.canon"]`` entry, so the
-# characterisation evidence and the performance evidence cannot drift apart.
-#
-# The import is indirect for a type-checker reason rather than a preference.
-# ``benchmarks/`` is a PEP 420 namespace package (no ``__init__.py``), so mypy maps
-# ``canon.py`` from its path to ``delayed_ab.canon``; a static ``from
-# benchmarks.delayed_ab.canon import ...`` resolves that same file a second time as
-# ``benchmarks.delayed_ab.canon``, and mypy halts with ``Source file found twice under
-# different module names`` followed by ``errors prevented further checking`` whenever
-# ``canon.py`` is checked alongside this file -- which every ``pre-commit run
-# --all-files`` does -- silencing the type check of the entire repository. That error
-# is raised while the module graph is assembled and carries no error code, so no
-# inline suppression reaches it, and both remedies mypy names are out of scope here:
-# ``benchmarks/__init__.py`` falls outside the paths the run's structural criterion
-# permits, while ``explicit_package_bases`` would edit the frozen ``pyproject.toml``.
-# Applying either one makes the static spelling work unchanged.
+# The single canonicaliser shared with the A/B harness: ``importlib`` names the
+# canonical runtime module, so this module and ``benchmarks.delayed_ab.main`` bind
+# the very same ``sys.modules["benchmarks.delayed_ab.canon"]`` entry and the two
+# bodies of evidence cannot drift apart. The static absolute import is unavailable
+# because ``benchmarks/`` is a namespace package, under which mypy maps ``canon.py``
+# under a second module name and rejects the build.
 _canon = importlib.import_module("benchmarks.delayed_ab.canon")
 canonical_graph = _canon.canonical_graph
 canonical_result = _canon.canonical_result
@@ -145,6 +134,7 @@ def _pin_tokenization(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     Yields:
         None: with ``dask.hashing.hashers`` pinned to SHA-1 and ``_CONFIG_PINS``
         applied, for the duration of one test.
+
     """
     monkeypatch.setattr(dask.hashing, "hashers", [dask.hashing._hash_sha1])
     with dask.config.set(_CONFIG_PINS):
@@ -162,6 +152,7 @@ def _pinned() -> Iterator[None]:
     Yields:
         None: with ``dask.hashing.hashers`` pinned to SHA-1 and ``_CONFIG_PINS``
         applied for the duration of the block.
+
     """
     saved = dask.hashing.hashers
     dask.hashing.hashers = [dask.hashing._hash_sha1]
@@ -185,70 +176,45 @@ def _pinned() -> Iterator[None]:
 
 
 def ident(*args: Any) -> tuple[Any, ...]:
-    """Return the positional arguments unchanged, as a tuple."""
     return args
 
 
 def collect(*args: Any, **kwargs: Any) -> tuple[tuple[Any, ...], dict[str, Any]]:
-    """Return both argument groups, so keyword arguments reach the result."""
     return args, kwargs
 
 
 def listof(*args: Any) -> list[Any]:
-    """Return the positional arguments as a list, a ``getitem`` target."""
     return list(args)
 
 
 def first(x: Any) -> Any:
-    """Return the single argument unchanged; used to wrap a callable value."""
     return x
 
 
 def pair() -> tuple[int, int]:
-    """Return a two-element tuple, for ``nout=2``."""
     return (1, 2)
 
 
 def single() -> tuple[int]:
-    """Return a one-element tuple, for ``nout=1``."""
     return (7,)
 
 
 def nothing() -> tuple[Any, ...]:
-    """Return an empty tuple, for ``nout=0``."""
     return ()
 
 
 class Inner:
-    """Attribute target for the attribute-of-attribute corpus entry."""
-
     def __init__(self, w: int) -> None:
-        """Store the one attribute the attribute-of-attribute entry reads.
-
-        Args:
-            w: Value exposed as ``self.w``.
-        """
         self.w = w
 
 
 class Obj:
-    """Plain object wrapped by ``delayed`` for the attribute and method entries."""
-
     def __init__(self, v: int) -> None:
-        """Set the three attributes the attribute and method entries reach for.
-
-        Args:
-            v: Value exposed as ``self.v``, the target of ``o.v`` and the base of
-                ``meth``'s result. ``self.items`` gives the ``getitem`` entry a
-                subscriptable attribute and ``self.inner`` gives the
-                attribute-of-attribute entry a second hop.
-        """
         self.v = v
         self.items = [10, 11, 12]
         self.inner = Inner(9)
 
     def meth(self, x: int) -> int:
-        """Return ``self.v + x``."""
         return self.v + x
 
     def __repr__(self) -> str:
@@ -264,15 +230,11 @@ class Obj:
 
 @dataclass
 class Box:
-    """Dataclass used both with literal fields and with a field holding a ``Delayed``."""
-
     a: Any
     b: str
 
 
 class Point(NamedTuple):
-    """Namedtuple used both with literal fields and with a field holding a ``Delayed``."""
-
     x: Any
     y: int
 
@@ -281,8 +243,8 @@ class HandRolledCollection:
     """A non-``Delayed`` dask collection, modelled on ``test_delayed.py``'s ``Tuple``.
 
     This is what drives the ``base.is_dask_collection(expr)`` branch of
-    ``unpack_collections`` (``dask/delayed.py:177-195``) without requiring NumPy,
-    so the branch is covered in a minimal-dependency environment too.
+    ``unpack_collections`` without requiring NumPy, so the branch is covered in a
+    minimal-dependency environment too.
     """
 
     __dask_scheduler__ = staticmethod(_threaded_get)
@@ -292,13 +254,6 @@ class HandRolledCollection:
     # graph shape, and both are used: a plain ``dict`` low-level graph and a
     # ``HighLevelGraph`` (see ``_hlg_backed_collection``).
     def __init__(self, dsk: Any, keys: list[str]) -> None:
-        """Store the graph and the output keys of the collection.
-
-        Args:
-            dsk: The collection's graph -- a plain ``dict`` low-level graph
-                mapping each key to its node, or a ``HighLevelGraph``.
-            keys: Output keys, in the order the finalizer receives them.
-        """
         self._dask = dsk
         self._keys = keys
 
@@ -310,36 +265,17 @@ class HandRolledCollection:
             method as it stands, without recursive dispatch
             (``dask/tokenize.py:194-198``), so the keys alone decide the
             deterministic token of any expression that wraps this collection.
+
         """
         return self._keys
 
     def __dask_graph__(self) -> Any:
-        """Return the graph.
-
-        Returns:
-            The graph as given to the constructor -- a plain ``dict``, which is
-            what a hand-rolled collection is allowed to expose, or a
-            ``HighLevelGraph`` for the ``_hlg_backed_collection`` variant.
-        """
         return self._dask
 
     def __dask_keys__(self) -> list[str]:
-        """Return the output keys.
-
-        Returns:
-            list: both keys, which is why finalizing this collection produces more
-            than one key and why it has to be reduced before it can be unpacked.
-        """
         return self._keys
 
     def __dask_postcompute__(self) -> tuple[Any, tuple[Any, ...]]:
-        """Return the finalizer that turns the computed keys into a value.
-
-        Returns:
-            tuple: ``(tuple, ())`` -- the computed keys are collected into a
-            tuple, with no extra arguments, exactly as ``test_delayed.py``'s
-            ``Tuple`` collection does.
-        """
         return tuple, ()
 
 
@@ -367,13 +303,6 @@ class SubDelayedLayers(Delayed):
     __slots__ = ()
 
     def __dask_layers__(self) -> Sequence[str]:
-        """Return the single layer name, exactly as the base class does.
-
-        Returns:
-            Sequence: ``(self._layer,)``. The value is deliberately identical to
-            ``Delayed.__dask_layers__``'s so that the graph content is unchanged
-            and the only difference is that the method is a subclass override.
-        """
         return (self._layer,)
 
 
@@ -390,14 +319,11 @@ class SubDelayedLayerDict(Delayed):
     def _layer_dict(self) -> dict[Any, Any]:
         """Fail: the construction path must never dispatch to this name.
 
-        Returns:
-            dict: never -- the method always raises. The annotation records what a
-            leaf-layer helper of this name would have had to return.
-
         Raises:
             AssertionError: always. Reaching this body would mean the graph-merge
                 helper looked the name up on the object instead of calling the
                 module-level function, letting a public subclass intercept it.
+
         """
         raise AssertionError(
             "a subclass method named _layer_dict must never be dispatched to"
@@ -414,15 +340,14 @@ def _leaf() -> Any:
 
     The return type is ``Any`` rather than ``Delayed`` on purpose: ``Delayed``
     binds its arithmetic, comparison and ``getitem`` operators dynamically at
-    import time (``Delayed._bind_operator``, ``dask/delayed.py:896-927``), so a
-    static checker cannot see them and the operator corpus entries below would
-    not type-check against a ``Delayed`` annotation.
+    import time through ``Delayed._bind_operator``, so a static checker cannot
+    see them and the operator corpus entries below would not type-check against a
+    ``Delayed`` annotation.
     """
     return delayed(inc, name="inc", pure=True)(1)
 
 
 def _other_leaf() -> Any:
-    """Return a second dependency with a different key, for two-dependency shapes."""
     return delayed(inc, name="inc-other", pure=True)(2)
 
 
@@ -430,26 +355,23 @@ def _ident() -> Any:
     """Return ``delayed(ident)`` with an explicit ``name``.
 
     The explicit name keeps the resulting call key derived from strings, ints and
-    dependency keys only -- ``call_function`` tokenizes ``self._key`` rather than
-    the callable (``dask/delayed.py:811``) -- so the key does not depend on how
-    the function object pickles. Entries that deliberately exercise the default
-    naming forms are listed in ``_DEFAULT_NAMING``.
+    dependency keys only -- ``call_function`` tokenizes the leaf's own key rather
+    than the callable -- so the key does not depend on how the function object
+    pickles. Entries that deliberately exercise the default naming forms are
+    listed in ``_DEFAULT_NAMING``.
     """
     return delayed(ident, name="ident", pure=True)
 
 
 def _collect() -> Any:
-    """Return ``delayed(collect)`` with an explicit name, for keyword arguments."""
     return delayed(collect, name="collect", pure=True)
 
 
 def _obj() -> Delayed:
-    """Return a ``delayed``-wrapped :class:`Obj` with an explicit name."""
     return delayed(Obj(3), name="obj", pure=True)
 
 
 def _hand_rolled_collection() -> HandRolledCollection:
-    """Return a two-key hand-rolled dask collection with a low-level graph."""
     return HandRolledCollection(
         {"ta": DataNode("ta", 1), "tb": DataNode("tb", 2)}, ["ta", "tb"]
     )
@@ -515,7 +437,6 @@ class _RaisingReprKey:
 
 
 def _hlg_of(key: str) -> HighLevelGraph:
-    """Return a single-layer ``HighLevelGraph`` holding one ``DataNode``."""
     return HighLevelGraph({key: {key: DataNode(key, 5)}}, {key: set()})
 
 
@@ -533,25 +454,22 @@ def _mapping_proxy_delayed() -> Delayed:
     """Return a ``Delayed`` whose graph is a ``types.MappingProxyType``.
 
     It is neither exactly a ``HighLevelGraph`` nor exactly a ``dict``, and
-    ``Delayed.__init__`` only validates the layer for a ``HighLevelGraph``
-    (``dask/delayed.py:688``), so construction succeeds and the object is a valid
-    dependency that no exact-graph-type guard may take a shortcut for.
+    ``Delayed.__init__`` only validates the layer for a ``HighLevelGraph``, so
+    construction succeeds and the object is a valid dependency that no
+    exact-graph-type guard may take a shortcut for.
     """
     return Delayed("mpkey", types.MappingProxyType({"mpkey": DataNode("mpkey", 5)}))
 
 
 def _sub_delayed() -> SubDelayed:
-    """Return a :class:`SubDelayed` dependency backed by a ``HighLevelGraph``."""
     return SubDelayed("subkey", _hlg_of("subkey"))
 
 
 def _sub_delayed_dask_layers() -> SubDelayedLayers:
-    """Return a :class:`SubDelayedLayers` dependency backed by a ``HighLevelGraph``."""
     return SubDelayedLayers("sublayerskey", _hlg_of("sublayerskey"))
 
 
 def _sub_delayed_layer_dict() -> SubDelayedLayerDict:
-    """Return a :class:`SubDelayedLayerDict` dependency backed by a ``HighLevelGraph``."""
     return SubDelayedLayerDict("sublayerdictkey", _hlg_of("sublayerdictkey"))
 
 
@@ -587,6 +505,7 @@ class _Expr(NamedTuple):
     ``test_flag_exclusions_are_documented`` keeps in step with this registry, and
     an entry whose computation raises is registered with its exact failure in
     ``_COMPUTE_FAILURES``.
+
     """
 
     name: str
@@ -599,13 +518,11 @@ class _Expr(NamedTuple):
 
 
 def _build_duplicate_positional() -> Delayed:
-    """``f(a, a)``: one dependency passed twice, de-duplicated by ``id``."""
     a = _leaf()
     return _ident()(a, a)
 
 
 def _build_duplicate_in_list() -> Delayed:
-    """``f([a, a, a])``: one dependency three times inside a container."""
     a = _leaf()
     return _ident()([a, a, a])
 
@@ -614,7 +531,7 @@ def _build_global_delayed_pure() -> Delayed:
     """Take the deterministic key from the *global* ``delayed_pure`` setting.
 
     ``pure`` is omitted, so ``dask.delayed.tokenize`` reads
-    ``config.get("delayed_pure", False)`` on every call (``dask/delayed.py:405``).
+    ``config.get("delayed_pure", False)`` on every call.
     """
     with dask.config.set({"delayed_pure": True}):
         return delayed(inc, name="inc")(1)
@@ -633,19 +550,16 @@ def _build_finalize_collection() -> Delayed:
 
 
 def _build_nout_one_element() -> Delayed:
-    """Unpack the single element of an ``nout=1`` call."""
     (x,) = delayed(single, name="single", pure=True, nout=1)()
     return x
 
 
 def _build_nout_two_first() -> Delayed:
-    """Unpack the first element of an ``nout=2`` call."""
     x, _y = delayed(pair, name="pair", pure=True, nout=2)()
     return x
 
 
 def _build_nout_two_second() -> Delayed:
-    """Unpack the second element of an ``nout=2`` call."""
     _x, y = delayed(pair, name="pair", pure=True, nout=2)()
     return y
 
@@ -672,10 +586,9 @@ def _build_list_with_dependent_task() -> Delayed:
     Nothing in the list is a dask collection, so the container branch of
     ``unpack_collections`` collects no collections at all -- and it still must
     not hand the list back unchanged, because the ``Task`` inside it references
-    the key ``"dn"``. What decides is ``List(*args).dependencies``
-    (``dask/delayed.py:206-221``), and a construction path that reads it must
-    reach the same verdict for a node whose ``dependencies`` are non-empty as for
-    a bare ``TaskRef``.
+    the key ``"dn"``. What decides is ``List(*args).dependencies``, and a
+    construction path that reads it must reach the same verdict for a node whose
+    ``dependencies`` are non-empty as for a bare ``TaskRef``.
     """
     return _ident()([Task("inner", ident, TaskRef("dn")), 1])
 
@@ -706,15 +619,16 @@ def _build_several_dependencies_with_attr() -> Delayed:
 def _build_delayed_call(pure: bool | None) -> Delayed:
     """Call a ``Delayed`` whose computed value is itself a callable.
 
-    ``Delayed.__call__`` routes through ``delayed(apply, pure=pure)``
-    (``dask/delayed.py:782-786``), so with ``pure`` omitted both the ``apply``
-    leaf key and the call key carry UUID tokens.
+    ``Delayed.__call__`` routes through ``delayed(apply, pure=pure)``, so with
+    ``pure`` omitted both the ``apply`` leaf key and the call key carry UUID
+    tokens.
 
     Args:
         pure: Forwarded to ``Delayed.__call__``; ``None`` omits the keyword.
 
     Returns:
         Delayed: the result of calling the delayed callable with ``1``.
+
     """
     callable_value = delayed(first, name="first", pure=True)(inc)
     if pure is None:
@@ -735,8 +649,8 @@ def _build_delayed_call(pure: bool | None) -> Delayed:
 # ---------------------------------------------------------------------------
 
 CORPUS: tuple[_Expr, ...] = (
-    # Atomic arguments: the branch cascade falls through to ``return expr, ()``
-    # (``dask/delayed.py:293``) for each of them.
+    # Atomic arguments: the branch cascade of ``unpack_collections`` falls
+    # through to ``return expr, ()`` for each of them.
     _Expr("arg_int", lambda: _ident()(1)),
     _Expr("arg_float", lambda: _ident()(1.5)),
     _Expr("arg_str", lambda: _ident()("s")),
@@ -744,14 +658,12 @@ CORPUS: tuple[_Expr, ...] = (
     _Expr("arg_bool", lambda: _ident()(True)),
     _Expr("arg_bytes", lambda: _ident()(b"xy")),
     _Expr("arg_complex", lambda: _ident()(complex(1, 2))),
-    # Wrapped non-callables and the two default naming forms
-    # (``dask/delayed.py:632-638`` and ``:642``).
+    # Wrapped non-callables and the two default naming forms ``delayed`` builds
+    # from ``obj.__name__`` and from ``type(obj).__name__``.
     _Expr("wrap_int_named", lambda: delayed(3, name="three")),
     _Expr("wrap_int_default", lambda: delayed(3), deterministic=False),
     _Expr("wrap_str_pure", lambda: delayed("s", pure=True)),
     _Expr("wrap_obj_pure", lambda: delayed(Obj(3), pure=True)),
-    # ``delayed(inc, pure=True)`` computes to the function object itself, whose
-    # repr embeds its address, so it is excluded from the result assertions.
     _Expr("wrap_func_pure", lambda: delayed(inc, pure=True), computable=False),
     _Expr("call_default_name", lambda: delayed(inc, pure=True)(1)),
     _Expr(
@@ -761,9 +673,9 @@ CORPUS: tuple[_Expr, ...] = (
     ),
     _Expr("wrap_taskref", lambda: delayed(TaskRef("dn")), computable=False),
     _Expr("wrap_datanode", lambda: delayed(DataNode("dn", 5), name="dn")),
-    # Wrapping a *traversed* non-callable container that holds a ``Delayed``
-    # (``dask/delayed.py:618-647``): ``unpack_collections`` returns a task rather
-    # than the object, so the wrap takes its second branch -- the generated
+    # Wrapping a *traversed* non-callable container that holds a ``Delayed``:
+    # ``unpack_collections`` returns a task rather than the object, so the wrap in
+    # ``delayed()`` takes its second branch -- the generated
     # ``type(obj).__name__-<token>`` key, the rewrite of the container node's own
     # key to that name, and a graph merged from the dependencies the traversal
     # found. The dict form carries two dependencies, so it also pins the
@@ -773,7 +685,7 @@ CORPUS: tuple[_Expr, ...] = (
         "wrap_dict_with_delayed",
         lambda: delayed({"k": _leaf(), "j": _other_leaf()}, pure=True),
     ),
-    # list/tuple/set branch (``dask/delayed.py:206-221``).
+    # list/tuple/set branch of ``unpack_collections``.
     _Expr("arg_list_literal", lambda: _ident()([1, 2, 3])),
     _Expr("arg_list_with_delayed", lambda: _ident()([_leaf(), 1])),
     _Expr("arg_tuple_literal", lambda: _ident()((1, 2))),
@@ -785,30 +697,29 @@ CORPUS: tuple[_Expr, ...] = (
     _Expr("arg_empty_tuple", lambda: _ident()(())),
     _Expr("arg_empty_set", lambda: _ident()(set())),
     _Expr("arg_empty_dict", lambda: _ident()({})),
-    # dict branch (``dask/delayed.py:223-236``) and the kwargs dict that
-    # ``call_function`` unpacks (``:818``) -- the path an empty-kwargs
-    # short-circuit must keep equivalent.
+    # dict branch, and the kwargs dict that ``call_function`` unpacks -- the path
+    # an empty-kwargs short-circuit must keep equivalent.
     _Expr("arg_dict_literal", lambda: _ident()({"k": 1})),
     _Expr("arg_dict_delayed_value", lambda: _ident()({"k": _leaf()})),
     _Expr("arg_dict_delayed_key", lambda: _ident()({_leaf(): 1})),
     _Expr("kwargs_literal", lambda: _collect()(x=1)),
     _Expr("kwargs_with_delayed", lambda: _collect()(x=_leaf())),
-    # slice branch (``dask/delayed.py:238-247``).
+    # slice branch.
     _Expr("arg_slice_literal", lambda: _ident()(slice(1, 5, 2))),
     _Expr("arg_slice_with_delayed", lambda: _ident()(slice(_leaf(), 5, None))),
-    # dataclass branch (``dask/delayed.py:249-281``).
+    # dataclass branch.
     _Expr("arg_dataclass_literal", lambda: _ident()(Box(a=1, b="s"))),
     _Expr("arg_dataclass_with_delayed", lambda: _ident()(Box(a=_leaf(), b="s"))),
-    # namedtuple branch (``dask/delayed.py:283-291``).
+    # namedtuple branch.
     _Expr("arg_namedtuple_literal", lambda: _ident()(Point(x=1, y=2))),
     _Expr("arg_namedtuple_with_delayed", lambda: _ident()(Point(x=_leaf(), y=2))),
-    # Iterator coercion (``dask/delayed.py:197-202``).
+    # Iterator coercion.
     _Expr("arg_list_iterator", lambda: _ident()(iter([1, 2]))),
-    # The layer-order lock: ``call_function`` tokenizes the *raw* iterator
-    # (``dask/delayed.py:811``) before ``unpack_collections`` coerces it, so
-    # ``tokenize`` pickles the underlying list -- including the ``Delayed`` it
-    # holds. A ``Delayed``'s pickled slot state contains its ``HighLevelGraph``,
-    # whose layer *insertion order* therefore feeds this key's token.
+    # The layer-order lock: ``call_function`` tokenizes the *raw* iterator before
+    # ``unpack_collections`` coerces it, so ``tokenize`` pickles the underlying
+    # list -- including the ``Delayed`` it holds. A ``Delayed``'s pickled slot
+    # state contains its ``HighLevelGraph``, whose layer *insertion order*
+    # therefore feeds this key's token.
     _Expr("arg_list_iterator_with_delayed", lambda: _ident()(iter([_leaf(), 1]))),
     _Expr("arg_tuple_iterator", lambda: _ident()(iter((1, 2)))),
     _Expr("arg_set_iterator", lambda: _ident()(iter({1}))),
@@ -818,9 +729,9 @@ CORPUS: tuple[_Expr, ...] = (
     _Expr("arg_duplicate_positional", _build_duplicate_positional),
     _Expr("arg_duplicate_in_list", _build_duplicate_in_list),
     _Expr("arg_two_dependencies", lambda: _ident()(_leaf(), _other_leaf())),
-    # Both arms of ``DelayedLeaf.dask`` (``dask/delayed.py:838-844``) as a
-    # dependency: a plain object becomes a ``DataNode``, a ``GraphNode`` is used
-    # as it stands. Plus a dependency carrying a plain ``dict`` graph.
+    # Both arms of ``DelayedLeaf.dask`` as a dependency: a plain object becomes a
+    # ``DataNode``, a ``GraphNode`` is used as it stands. Plus a dependency
+    # carrying a plain ``dict`` graph.
     # A ``DelayedLeaf`` wrapping a callable computes to the function object, whose
     # repr embeds its address, so the value-wrapping variant beside it is the one
     # that takes part in the result assertions.
@@ -859,17 +770,17 @@ CORPUS: tuple[_Expr, ...] = (
         _build_list_with_dependent_task,
         computable=False,
     ),
-    # Non-``Delayed`` dask collection (``dask/delayed.py:177-195``). Its graph
-    # acquires a ``finalize-hlgfinalizecompute-<hex>-<hex>`` layer whose two
-    # hexes are ``uuid4().hex`` fallbacks from ``dask._expr``, and the same hex
-    # suffixes the node keys inside that layer, so the *raw* canonical dict
-    # differs between two builds of the same expression. Everything else about
-    # the graph is fixed, and that is what ``volatile_tokens`` asserts: the
-    # golden holds the canonical form with only the observedly-random tokens
-    # replaced by ``<hexN>``, so every key, node kind, dependency and insertion
-    # order stays compared. ``finalize()`` stores an ``HLGFinalizeCompute``
-    # expression rather than a graph container, which is the same situation one
-    # volatile token further on.
+    # Non-``Delayed`` dask collection, the branch ``unpack_collections`` routes
+    # through ``collections_to_expr``. Its graph acquires a
+    # ``finalize-hlgfinalizecompute-<hex>-<hex>`` layer whose two hexes are
+    # ``uuid4().hex`` fallbacks from ``dask._expr``, and the same hex suffixes the
+    # node keys inside that layer, so the *raw* canonical dict differs between two
+    # builds of the same expression. Everything else about the graph is fixed, and
+    # that is what ``volatile_tokens`` asserts: the golden holds the canonical
+    # form with only the observedly-random tokens replaced by ``<hexN>``, so every
+    # key, node kind, dependency and insertion order stays compared.
+    # ``finalize()`` stores an ``HLGFinalizeCompute`` expression rather than a
+    # graph container, which is the same situation one volatile token further on.
     _Expr(
         "arg_hand_rolled_collection",
         lambda: _ident()(_hand_rolled_collection()),
@@ -883,7 +794,7 @@ CORPUS: tuple[_Expr, ...] = (
         computable=False,
         volatile_tokens=True,
     ),
-    # ``pure`` semantics (``dask/delayed.py:392-410``).
+    # ``pure`` semantics, as the module-local ``tokenize`` wrapper decides them.
     _Expr("call_pure_true", lambda: delayed(inc, name="inc", pure=True)(1)),
     _Expr(
         "call_pure_false",
@@ -891,14 +802,15 @@ CORPUS: tuple[_Expr, ...] = (
         deterministic=False,
     ),
     _Expr("call_global_delayed_pure", _build_global_delayed_pure),
-    # Explicit naming (``dask/delayed.py:810-813``).
+    # Explicit naming: ``dask_key_name`` overrides the generated call key.
     _Expr(
         "call_dask_key_name",
         lambda: delayed(inc, name="inc", pure=True)(
             1, dask_key_name="explicit-call-key"
         ),
     ),
-    # ``nout`` (``dask/delayed.py:627-628``, ``:771-780``, ``:826``).
+    # ``nout``: validated by ``delayed``, stored as ``_length``, and passed to
+    # the call node as ``length=nout``.
     _Expr("nout_none", lambda: delayed(pair, name="pair", pure=True)()),
     _Expr("nout_zero", lambda: delayed(nothing, name="nothing", pure=True, nout=0)()),
     _Expr("nout_one", lambda: delayed(single, name="single", pure=True, nout=1)()),
@@ -906,38 +818,35 @@ CORPUS: tuple[_Expr, ...] = (
     _Expr("nout_two", lambda: delayed(pair, name="pair", pure=True, nout=2)()),
     _Expr("nout_two_unpacked_first", _build_nout_two_first),
     _Expr("nout_two_unpacked_second", _build_nout_two_second),
-    # Unpacking routes through the same bound ``getitem`` operator, so this entry
-    # differs from ``nout_two_unpacked_second`` only in how it is written.
     _Expr(
         "nout_two_getitem_one",
         lambda: delayed(pair, name="pair", pure=True, nout=2)()[1],
     ),
-    # ``traverse=False`` (``dask/delayed.py:621-625``): the object is quoted and
-    # no dependency is collected, so the ``Delayed`` inside survives into the
-    # computed value as an object.
+    # ``traverse=False``: the object is quoted and no dependency is collected, so
+    # the ``Delayed`` inside survives into the computed value as an object.
     _Expr(
         "traverse_false_with_delayed",
         lambda: delayed([_leaf(), 1], traverse=False, name="quoted"),
     ),
-    # Lazy attribute access (``dask/delayed.py:743-755``, ``:883-888``). These
-    # layers hold the legacy tuple task ``(getattr, key, attr)``, which the
-    # graph-shape contract freezes; the canonicaliser reports it as
-    # ``"legacy-tuple"``.
+    # Lazy attribute access through ``Delayed.__getattr__`` and
+    # ``DelayedAttr.dask``. These layers hold the legacy tuple task ``(getattr,
+    # key, attr)``, which the graph-shape contract freezes; the canonicaliser
+    # reports it as ``"legacy-tuple"``.
     _Expr("attr_v", lambda: _obj().v),
     _Expr("attr_of_attr", lambda: _obj().inner.w),
     _Expr("attr_items_getitem", lambda: _obj().items[1]),
-    # Method calls (``dask/delayed.py:890-893``). ``DelayedAttr.__call__`` does
-    # not forward ``pure``, so a method call is impure unless ``pure=True`` is
-    # passed in the call kwargs, where ``call_function`` pops it (``:808``).
+    # Method calls through ``DelayedAttr.__call__``, which does not forward
+    # ``pure``, so a method call is impure unless ``pure=True`` is passed in the
+    # call kwargs, where ``call_function`` pops it.
     _Expr("method_pure", lambda: _obj().meth(2, pure=True)),
     _Expr("method_impure", lambda: _obj().meth(2), deterministic=False),
-    # Operators (``dask/delayed.py:798-803``, ``:896-927``).
+    # Operators, bound through ``Delayed._get_binary_operator`` and ``right``.
     _Expr("op_add", lambda: _leaf() + _other_leaf()),
     _Expr("op_reflected_add", lambda: 1 + _leaf()),
     _Expr("op_neg", lambda: -_leaf()),
     _Expr("op_lt", lambda: _leaf() < _other_leaf()),
     _Expr("op_getitem", lambda: delayed(listof, name="listof", pure=True)(1, 2, 3)[1]),
-    # ``Delayed.__call__`` on a delayed callable (``dask/delayed.py:782-786``).
+    # ``Delayed.__call__`` on a delayed callable.
     _Expr("delayed_call_pure", lambda: _build_delayed_call(True)),
     _Expr(
         "delayed_call_impure", lambda: _build_delayed_call(None), deterministic=False
@@ -1032,9 +941,8 @@ _COMPUTE_FAILURES: dict[str, tuple[type[BaseException], str]] = {
 }
 
 #: Entries that deliberately keep ``delayed``'s default naming, so the
-#: ``obj.__name__-<token>`` (``dask/delayed.py:632-638``) and
-#: ``type(obj).__name__-<token>`` (``:642``) key forms are locked under the
-#: pinned hasher rather than derived from an explicit ``name=``.
+#: ``obj.__name__-<token>`` and ``type(obj).__name__-<token>`` key forms are
+#: locked under the pinned hasher rather than derived from an explicit ``name=``.
 _DEFAULT_NAMING: tuple[str, ...] = (
     "wrap_int_default",
     "wrap_str_pure",
@@ -1055,9 +963,11 @@ _GUARD_ENTRIES: tuple[str, ...] = (
     "arg_several_deps_guard_mixed",
 )
 
-#: Every branch of ``unpack_collections`` (``dask/delayed.py:115-293``) mapped to
-#: one corpus entry that exercises it, asserted by
-#: ``test_every_unpack_collections_branch_is_covered``.
+#: Every branch of ``unpack_collections`` mapped to one corpus entry that
+#: exercises it, asserted by ``test_every_unpack_collections_branch_is_covered``.
+#: The line numbers inside the branch labels below locate those branches in
+#: ``dask/delayed.py`` at base commit ``c9d1df34``, the revision this corpus was
+#: captured against, and are not current line numbers.
 _BRANCH_COVERAGE: dict[str, str] = {
     "Delayed short-circuit (:166-172)": "arg_list_with_delayed",
     "non-Delayed dask collection (:177-195)": "arg_hand_rolled_collection",
@@ -1084,17 +994,6 @@ _BRANCH_COVERAGE: dict[str, str] = {
 
 
 def _by_name(name: str) -> _Expr:
-    """Return the corpus entry registered under ``name``.
-
-    Args:
-        name: Registry key of the wanted entry.
-
-    Returns:
-        _Expr: the matching entry.
-
-    Raises:
-        KeyError: if no entry is registered under that name.
-    """
     for entry in CORPUS:
         if entry.name == name:
             return entry
@@ -4060,6 +3959,7 @@ def _walk_strings(value: Any) -> Iterator[str]:
         str: each string leaf, dicts in insertion order and lists in order, so
         that two canonical forms of the same shape yield their strings in
         corresponding positions.
+
     """
     if isinstance(value, str):
         yield value
@@ -4082,6 +3982,7 @@ def _hex_tokens(graph: dict[str, Any]) -> list[str]:
         in the order the deterministic walk first reaches it. Both a ``tokenize``
         digest and a ``uuid4().hex`` fallback have that shape; which is which is
         decided by comparing two builds, not here.
+
     """
     tokens: list[str] = []
     for text in _walk_strings(graph):
@@ -4105,6 +4006,7 @@ def _substitute(value: Any, replacements: dict[str, str]) -> Any:
     Returns:
         Any: the same structure with every occurrence of every token replaced,
         and nothing else touched.
+
     """
     if isinstance(value, str):
         for token, placeholder in replacements.items():
@@ -4138,6 +4040,7 @@ def _stable_graph(entry: _Expr) -> dict[str, Any]:
     Returns:
         dict: the canonical graph with the ``i``-th random token replaced by
         ``f"<hex{i}>"``.
+
     """
     first = canonical_graph(entry.build())
     second = canonical_graph(entry.build())
@@ -4187,6 +4090,7 @@ def _golden_names(names: Sequence[Any]) -> list[Any]:
     Returns:
         list: the same sequence with every non-JSON-expressible name replaced by
         its ``repr``.
+
     """
     coerced: list[Any] = []
     for name in names:
@@ -4219,6 +4123,7 @@ def _golden_entry(entry: _Expr) -> dict[str, Any]:
     can hold only source-representable values. The ordinary ``==`` comparison of
     results is done by the cross-scheduler and pickle tests through
     ``canonical_result``.
+
     """
     obj = entry.build()
     table: dict[str, str] = {}
@@ -4243,6 +4148,7 @@ def _golden_block_bounds(lines: list[str]) -> tuple[int, int]:
         RuntimeError: if either marker is missing or they appear out of order.
             Refusing to write is the point: a golden fixture appended to the
             wrong place, or silently dropped, is worse than no capture at all.
+
     """
     begin: int | None = None
     end: int | None = None
@@ -4278,6 +4184,7 @@ def write_golden() -> None:
 
     Raises:
         RuntimeError: if the golden markers cannot be located.
+
     """
     with _pinned():
         golden = {entry.name: _golden_entry(entry) for entry in CORPUS}
@@ -4303,11 +4210,15 @@ def write_golden() -> None:
 
 @pytest.mark.parametrize("entry", CORPUS, ids=[entry.name for entry in CORPUS])
 def test_characterisation(entry: _Expr) -> None:
-    """Assert the golden key, canonical graph and computed result of one entry.
+    """Compare one corpus entry against its frozen golden record.
 
-    This is the assertion the whole refactor is measured against: every field
-    compared here is an observable property of ``dask.delayed`` that a purely
-    internal performance change must leave untouched.
+    Args:
+        entry: The corpus entry to build. Its generated key, its canonical graph
+            -- or its stable graph, for an entry carrying inherently random
+            tokens -- and its computed result are compared against
+            ``GOLDEN[entry.name]``, which was captured before the refactor and is
+            never regenerated to make this test pass.
+
     """
     golden = GOLDEN[entry.name]
     obj = entry.build()
@@ -4393,14 +4304,12 @@ def test_characterisation(entry: _Expr) -> None:
 
 
 def test_delayed_of_a_delayed_returns_the_same_object() -> None:
-    """``delayed`` short-circuits on a ``Delayed`` (``dask/delayed.py:618-619``)."""
     existing = _leaf()
     assert delayed(existing) is existing
     assert delayed(existing, name="ignored", pure=True, nout=3) is existing
 
 
 def test_corpus_floor_and_golden_cover_each_other() -> None:
-    """The corpus meets its floor, has unique names and matches the golden exactly."""
     names = [entry.name for entry in CORPUS]
     assert len(names) == len(set(names)), "corpus names must be unique"
     assert (
@@ -4415,25 +4324,22 @@ def test_corpus_floor_and_golden_cover_each_other() -> None:
 def test_default_naming_key_forms_are_locked() -> None:
     """At least five entries keep default naming, locking both generated forms.
 
-    ``obj.__name__-<token>`` (``dask/delayed.py:632-638``) and
-    ``type(obj).__name__-<token>`` (``:642``) are only exercised when no explicit
-    ``name=`` is passed, and their tokens depend on the pinned hasher.
+    ``obj.__name__-<token>`` and ``type(obj).__name__-<token>`` are only
+    exercised when no explicit ``name=`` is passed, and their tokens depend on
+    the pinned hasher.
     """
     names = {entry.name for entry in CORPUS}
     assert len(_DEFAULT_NAMING) >= 5
     assert set(_DEFAULT_NAMING) <= names
-    # ``type(obj).__name__`` forms.
     assert GOLDEN["wrap_int_default"]["key"].startswith("int-")
     assert GOLDEN["wrap_str_pure"]["key"].startswith("str-")
     assert GOLDEN["wrap_obj_pure"]["key"].startswith("Obj-")
     assert GOLDEN["wrap_list_traverse_false_default"]["key"].startswith("list-")
-    # ``obj.__name__`` forms, for the leaf and for the call it keys.
     assert GOLDEN["wrap_func_pure"]["key"].startswith("inc-")
     assert GOLDEN["call_default_name"]["key"].startswith("inc-")
 
 
 def test_every_unpack_collections_branch_is_covered() -> None:
-    """Each branch of ``unpack_collections`` maps to a corpus entry that reaches it."""
     names = {entry.name for entry in CORPUS}
     missing = {
         branch: name for branch, name in _BRANCH_COVERAGE.items() if name not in names
@@ -4472,7 +4378,7 @@ def test_guard_entries_defeat_every_merge_shortcut_guard() -> None:
     assert type(proxy) is Delayed
     # Neither exactly a ``HighLevelGraph`` nor exactly a ``dict``, so a
     # graph-type guard must reject it; ``Delayed.__init__`` accepts it because it
-    # only validates the layer for a ``HighLevelGraph`` (``dask/delayed.py:688``).
+    # only validates the layer for a ``HighLevelGraph``.
     # Compared by exact type rather than ``isinstance``, and with the positive
     # check last: ``MappingProxyType`` is ``final``, so once a static checker has
     # narrowed the expression to it, any further class comparison is reported as
@@ -4484,7 +4390,6 @@ def test_guard_entries_defeat_every_merge_shortcut_guard() -> None:
 
 
 def test_flag_exclusions_are_documented() -> None:
-    """Every ``False`` flag in the corpus is justified by name, and none is stale."""
     flagged = {
         entry.name
         for entry in CORPUS
@@ -4559,32 +4464,13 @@ class _CountingKey:
     """A valid graph key that counts the ``repr()`` calls made on it."""
 
     def __repr__(self) -> str:
-        """Count one ``repr()`` call and return a fixed representation.
-
-        Returns:
-            str: a constant, so the count is the only thing that varies.
-        """
         _COUNTS["repr"] += 1
         return "_CountingKey()"
 
     def __hash__(self) -> int:
-        """Return a constant hash, making the object usable as a graph key.
-
-        Returns:
-            int: a fixed value. It is not counted: this class observes ``repr``
-            only, and hashing has to work for the object to be a key at all.
-        """
         return 4242
 
     def __eq__(self, other: object) -> bool:
-        """Compare by identity, so equal hashes never merge two distinct keys.
-
-        Args:
-            other: The object compared against.
-
-        Returns:
-            bool: True only for the very same instance.
-        """
         return self is other
 
 
@@ -4592,33 +4478,13 @@ class _CountingLayer:
     """A layer name object that counts the ``hash()`` calls made on it."""
 
     def __repr__(self) -> str:
-        """Return a fixed representation, uncounted.
-
-        Returns:
-            str: a constant. This class observes ``hash`` only, so its ``repr``
-            deliberately has no side effect.
-        """
         return "_CountingLayer()"
 
     def __hash__(self) -> int:
-        """Count one ``hash()`` call and return a constant hash.
-
-        Returns:
-            int: a fixed value, so every dict and set operation on this layer
-            name hashes to the same bucket and only the count varies.
-        """
         _COUNTS["hash"] += 1
         return 99
 
     def __eq__(self, other: object) -> bool:
-        """Compare by identity, so the constant hash cannot merge two names.
-
-        Args:
-            other: The object compared against.
-
-        Returns:
-            bool: True only for the very same instance.
-        """
         return self is other
 
 
@@ -4626,36 +4492,25 @@ class _CountingMeta(type):
     """Metaclass that counts ``==`` against the class and forbids ``hash()``."""
 
     def __eq__(cls, other: object) -> bool:
-        """Count one comparison against the class and compare by identity.
-
-        Args:
-            other: The object the class is compared against -- in practice each
-                element of the ``(list, tuple, set)`` membership test in
-                ``unpack_collections`` (``dask/delayed.py:206``).
-
-        Returns:
-            bool: True only when ``other`` is this very class.
-        """
         _COUNTS["eq"] += 1
         return cls is other
 
     def __hash__(cls) -> int:
         """Fail: the construction path must never hash a type object.
 
-        Returns:
-            int: never -- the method always raises. A metaclass defining
-                ``__eq__`` has to define ``__hash__`` too, and raising here is
-                what turns "the branch cascade hashed a type" into a failure
-                instead of a silent behaviour change.
+        A metaclass defining ``__eq__`` has to define ``__hash__`` too, and
+        raising here is what turns "the branch cascade hashed a type" into a
+        failure instead of a silent behaviour change.
 
         Raises:
             AssertionError: always.
+
         """
         raise AssertionError("the construction path must never hash a type object")
 
 
 class _WithCountingMeta(metaclass=_CountingMeta):
-    """An ordinary value whose *type* observes equality comparisons."""
+    pass
 
 
 def test_dependency_key_is_repred_once_for_an_impure_call() -> None:
@@ -4664,12 +4519,12 @@ def test_dependency_key_is_repred_once_for_an_impure_call() -> None:
     Mechanism, all of it observable: ``HighLevelGraph.from_collections`` probes
     each dependency with ``is_dask_collection``, which reads ``c.expr``
     (``dask/base.py:247-253``); ``Delayed.__getattr__`` turns that into a
-    throw-away ``DelayedAttr(c, "expr")`` whose ``__init__`` tokenizes
-    (``dask/delayed.py:743-755``, ``:867-868``). Inside ``tokenize``,
-    ``normalize_object`` sees ``__dask_tokenize__`` and returns the dependency's
-    key *as is*, without recursive dispatch (``dask/tokenize.py:194-198``), and
-    ``_tokenize`` then calls ``str()`` on the normalised tuple
-    (``dask/tokenize.py:33-39``) -- which invokes the key's ``__repr__``.
+    throw-away ``DelayedAttr(c, "expr")`` whose ``__init__`` tokenizes. Inside
+    ``tokenize``, ``normalize_object`` sees ``__dask_tokenize__`` and returns the
+    dependency's key *as is*, without recursive dispatch
+    (``dask/tokenize.py:194-198``), and ``_tokenize`` then calls ``str()`` on the
+    normalised tuple (``dask/tokenize.py:33-39``) -- which invokes the key's
+    ``__repr__``.
 
     The count is therefore a behavioural contract for user-defined keys, not an
     implementation detail: a construction path that drops the probe for such a
@@ -4714,8 +4569,8 @@ def test_dependency_layer_name_is_hashed_twice_for_a_high_level_graph() -> None:
     calls do not add any: copying a ``dict`` reuses the stored hashes.
 
     The hash of the layer name during ``Delayed.__init__``'s membership check
-    (``dask/delayed.py:688``) happens before the counter is reset, so it is
-    deliberately not part of the count.
+    happens before the counter is reset, so it is deliberately not part of the
+    count.
     """
     layer_name = _CountingLayer()
     # Annotated ``Any`` because ``HighLevelGraph`` declares its layer names as
@@ -4801,8 +4656,6 @@ def test_attribute_chain_over_an_unsafe_ancestor_hashes_its_layer_as_today() -> 
     """
     for depth, expected in ((0, 2), (1, 5), (2, 11)):
         layer_name = _CountingLayer()
-        # ``HighLevelGraph`` declares its layer names as ``str`` while the runtime
-        # accepts -- and this test requires -- an arbitrary hashable object.
         layers: dict[Any, Any] = {layer_name: {"dkey": DataNode("dkey", 5)}}
         layer_dependencies: dict[Any, Any] = {layer_name: set()}
         dependency: Delayed = Delayed(
@@ -4823,7 +4676,7 @@ def test_unpack_collections_compares_types_three_times_and_never_hashes() -> Non
     """``unpack_collections`` compares the value's type three times, hashing none.
 
     The three comparisons are the tuple-membership test ``typ in (list, tuple,
-    set)`` (``dask/delayed.py:206``), which uses ``==`` element-wise and never
+    set)`` inside ``unpack_collections``, which uses ``==`` element-wise and never
     hashes. ``_CountingMeta.__hash__`` raises, so any fast path that reached for a
     ``set``/``frozenset`` membership test -- or that dispatched on the type object
     in a dict -- would fail this test rather than quietly change the side effects
@@ -4844,12 +4697,11 @@ def test_nominal_immutability_asymmetry_is_preserved() -> None:
 
     Declared slot names can be assigned and deleted; everything else raises. This
     test asserts the asymmetry rather than the stricter immutability one might
-    expect, because the asymmetry is the current observable behaviour
-    (``dask/delayed.py:757-770``) and no part of this work strengthens it.
+    expect, because the asymmetry is what ``Delayed.__setattr__`` and
+    ``Delayed.__setitem__`` do, and no part of this work strengthens it.
     """
     obj = _leaf()
 
-    # A declared slot name succeeds and reads back.
     obj._length = 5
     assert obj._length == 5
     assert len(obj) == 5
@@ -4860,8 +4712,7 @@ def test_nominal_immutability_asymmetry_is_preserved() -> None:
         obj[0] = 1
 
     # There is no ``__delattr__`` override, so slot deletion has its default
-    # semantics; afterwards the read routes through ``__getattr__``
-    # (``dask/delayed.py:743-746``).
+    # semantics; afterwards the read routes through ``Delayed.__getattr__``.
     del obj._length
     with pytest.raises(AttributeError, match="Attribute _length not found"):
         obj._length
@@ -4925,56 +4776,70 @@ def test_non_runnable_entries_fail_exactly_as_they_did() -> None:
         assert str(excinfo.value) == message, name
 
 
-def test_no_finalize_result_exists_to_characterise() -> None:
-    """``finalize()`` cannot be computed for *any* collection at this commit.
+def _assert_finalize_is_not_computable(label: str, collection: Any) -> None:
+    """Assert that ``finalize`` wraps a collection into an uncomputable ``Delayed``.
 
-    This test exists because of what it forecloses. The corpus is required to
-    characterise ``dask.delayed.finalize`` of a non-``Delayed`` collection, and a
-    characterisation would normally pin the computed result; ``finalize_collection``
-    cannot, and the reason is not a property of the chosen collection. ``finalize``
-    stores ``collections_to_expr(collection).finalize_compute()`` -- an
-    ``HLGFinalizeCompute`` expression -- in the ``Delayed``, and computing any such
-    object reaches ``collection.dask.copy()`` in ``dask._expr``, which an
-    expression does not provide.
+    Args:
+        label: Name of the collection shape, attached to every assertion so a
+            failure names the shape whose behaviour moved.
+        collection: A dask collection to wrap with ``dask.delayed.finalize``.
 
-    Four collections are tried here, deliberately covering every shape available
-    without an optional dependency: a hand-rolled collection with a plain ``dict``
-    low-level graph, a hand-rolled collection with a ``HighLevelGraph``, a
-    ``Delayed``, and -- when NumPy is installed -- a ``dask.array``. All four fail
-    identically. There is therefore no successful pre-refactor result to capture
-    for this path, which is recorded here rather than passed over: the graph is
-    asserted in full through ``stable_graph``, the failure verbatim through
-    ``_COMPUTE_FAILURES``, and a future release that makes ``finalize`` computable
-    will fail this test and prompt the golden to gain a result.
+    Raises:
+        AssertionError: if the wrapper is not a plain ``Delayed`` keyed
+            ``finalize-<token>`` over an ``HLGFinalizeCompute`` expression, or if
+            computing it does not raise the exact exception recorded for
+            ``finalize_collection`` in ``_COMPUTE_FAILURES``.
+
     """
     expected_type, message = _COMPUTE_FAILURES["finalize_collection"]
+    with dask.config.set({"delayed_pure": True}):
+        wrapped = finalize(collection)
+        assert type(wrapped) is Delayed, label
+        assert wrapped.key.startswith("finalize-"), label
+        assert type(wrapped.__dask_graph__()).__name__ == "HLGFinalizeCompute", label
+        with pytest.raises(expected_type) as excinfo:
+            canonical_result([wrapped])
+        assert type(excinfo.value) is expected_type, label
+        assert str(excinfo.value) == message, label
 
-    candidates: list[tuple[str, Any]] = [
+
+def test_no_finalize_result_exists_to_characterise() -> None:
+    """``finalize()`` has no computable result for any NumPy-free corpus shape.
+
+    ``finalize`` stores ``collections_to_expr(collection).finalize_compute()`` --
+    an ``HLGFinalizeCompute`` expression -- in the ``Delayed``, and computing one
+    reaches ``collection.dask.copy()`` in ``dask._expr``, which an expression
+    does not provide. The three shapes asserted here are the ones reachable
+    without an optional dependency, and between them they cover the graph shapes
+    a collection can carry: a hand-rolled collection with a plain ``dict``
+    low-level graph, a hand-rolled collection with a ``HighLevelGraph``, and a
+    ``Delayed``. ``test_finalize_of_a_dask_array_is_not_computable_either``
+    asserts the same of a ``dask.array`` wherever NumPy is installed.
+
+    The ``finalize_collection`` corpus entry therefore records no result: its
+    graph is asserted in full through ``stable_graph`` and its failure verbatim
+    through ``_COMPUTE_FAILURES``.
+    """
+    for label, collection in (
         ("dict-graph collection", _hand_rolled_collection()),
         ("HighLevelGraph collection", _hlg_backed_collection()),
         ("Delayed", _leaf()),
-    ]
-    try:
-        import numpy
+    ):
+        _assert_finalize_is_not_computable(label, collection)
 
-        import dask.array as da
-    except ImportError:  # pragma: no cover - exercised only without NumPy
-        pass
-    else:
-        candidates.append(("dask.array", da.from_array(numpy.arange(4), chunks=2)))
 
-    with dask.config.set({"delayed_pure": True}):
-        for label, collection in candidates:
-            wrapped = finalize(collection)
-            assert type(wrapped) is Delayed, label
-            assert wrapped.key.startswith("finalize-"), label
-            assert (
-                type(wrapped.__dask_graph__()).__name__ == "HLGFinalizeCompute"
-            ), label
-            with pytest.raises(expected_type) as excinfo:
-                canonical_result([wrapped])
-            assert type(excinfo.value) is expected_type, label
-            assert str(excinfo.value) == message, label
+def test_finalize_of_a_dask_array_is_not_computable_either() -> None:
+    """A ``dask.array`` collection wrapped with ``finalize`` fails the same way.
+
+    Guarded in the body rather than at module level, so an environment without
+    NumPy skips only this function while the NumPy-free shapes above still run.
+    """
+    np = pytest.importorskip("numpy")
+    da = pytest.importorskip("dask.array")
+
+    _assert_finalize_is_not_computable(
+        "dask.array", da.from_array(np.arange(4), chunks=2)
+    )
 
 
 def test_canonicaliser_refuses_a_key_it_cannot_encode_reproducibly() -> None:
@@ -4996,7 +4861,6 @@ def test_canonicaliser_refuses_a_key_it_cannot_encode_reproducibly() -> None:
         with pytest.raises(TypeError) as excinfo:
             canonical_graph(dependency)
         assert "cannot canonicalise a graph key of type" in str(excinfo.value), label
-        # The rejection names the type, and nothing of the object itself.
         assert type(key).__qualname__ in str(excinfo.value), label
 
     # The encodable shapes still go through, byte for byte as before.
@@ -5024,7 +4888,6 @@ def test_impure_fan_in_canonicalises_identically_on_two_builds() -> None:
     first = canonical_graph(build())
     second = canonical_graph(build())
     assert first == second
-    # And the placeholders really are in play: every key here carries a UUID.
     assert first["key"].endswith("-#0")
     assert len(first["layer_order"]) == 7
 
@@ -5037,7 +4900,7 @@ def test_tuple_key_with_a_non_builtin_element_falls_back() -> None:
     What rides on it is observable: the generic
     ``HighLevelGraph.from_collections`` probes each dependency with
     ``is_dask_collection``, which builds a throw-away ``DelayedAttr(c, "expr")``
-    whose ``tokenize`` ``repr()``\\ s the dependency's key
+    whose ``tokenize`` calls ``repr()`` on the dependency's key
     (``dask/tokenize.py:33-39``). One ``repr`` call is therefore the pre-refactor
     behaviour for such a key -- measured -- and a shortcut that accepted the
     tuple would make that call disappear.
@@ -5046,9 +4909,6 @@ def test_tuple_key_with_a_non_builtin_element_falls_back() -> None:
     JSON-expressible nor safe to serialise (the canonicaliser refuses a key it
     cannot encode reproducibly). The graph is therefore asserted here, directly.
     """
-    # Annotated ``Any`` for the same reason the counting-layer tests are:
-    # ``HighLevelGraph`` declares its layer names as ``str`` while the runtime
-    # accepts -- and this test requires -- an arbitrary hashable object.
     key: Any = ("tk", _CountingKey())
     dependency = Delayed(key, {key: DataNode(key, 5)})
 
@@ -5069,8 +4929,6 @@ def test_tuple_key_with_a_non_builtin_element_falls_back() -> None:
     assert list(graph.dependencies) == [result.key, key]
     assert graph.dependencies[result.key] == {key}
     assert graph.dependencies[key] == set()
-    # The key object itself -- not a copy and not its repr -- still names the
-    # dependency's layer and its node.
     assert [node_key is key for node_key in dict(graph.layers[key])] == [True]
     assert list(result.__dask_keys__()) == [result.key]
     assert tuple(result.__dask_layers__()) == (result.key,)
@@ -5151,31 +5009,12 @@ class _MultiKeyCollection:
     """
 
     def __init__(self, expr: Any) -> None:
-        """Store the multi-output expression this collection exposes.
-
-        Args:
-            expr: A real ``Expr`` -- an ``_ExprSequence`` over two single-key
-                expressions -- published as ``self.expr`` so that
-                ``is_dask_collection`` accepts the wrapper and
-                ``collections_to_expr`` uses the expression as it stands.
-        """
         self.expr = expr
 
     def __dask_graph__(self) -> Any:
-        """Return the wrapped expression's graph.
-
-        Returns:
-            Any: whatever the expression materialises, delegated unchanged.
-        """
         return self.expr.__dask_graph__()
 
     def __dask_keys__(self) -> Any:
-        """Return the wrapped expression's keys.
-
-        Returns:
-            Any: both output keys, delegated unchanged -- which is what makes
-            finalizing this collection produce more than one key.
-        """
         return self.expr.__dask_keys__()
 
 
@@ -5197,12 +5036,6 @@ _STRICT_DETERMINISTIC: tuple[str, ...] = (
 
 @pytest.mark.parametrize("bad", [-1, "x", 1.5])
 def test_nout_must_be_none_or_a_non_negative_int(bad: object) -> None:
-    """``nout`` validation (``dask/delayed.py:627-628``).
-
-    The whole message is compared, offending value included, because the value is
-    interpolated into it: a fragment match would still pass if the interpolation
-    were dropped, reworded or moved.
-    """
     with pytest.raises(ValueError) as excinfo:
         delayed(inc, name="inc", nout=bad)
     assert (
@@ -5211,7 +5044,7 @@ def test_nout_must_be_none_or_a_non_negative_int(bad: object) -> None:
 
 
 def test_nout_zero_is_a_length_of_zero_not_an_absent_length() -> None:
-    """``nout=0`` keeps a zero length (``:627-628``, ``:771-780``, ``:826``).
+    """``nout=0`` keeps a zero length rather than an absent one.
 
     ``nout`` is validated as "None or a non-negative int" and stored verbatim in
     ``_length``, so zero and ``None`` are two different states: zero makes the
@@ -5240,11 +5073,6 @@ def test_nout_zero_is_a_length_of_zero_not_an_absent_length() -> None:
 
 
 def test_delayed_rejects_a_layer_absent_from_its_high_level_graph() -> None:
-    """``Delayed.__init__`` validates ``layer`` against the HLG (``:688-691``).
-
-    The message carries both the offending layer and the graph's actual layer
-    list, so it is compared in full.
-    """
     graph = _hlg_of("present")
     with pytest.raises(ValueError) as excinfo:
         Delayed("present", graph, layer="absent")
@@ -5255,12 +5083,6 @@ def test_delayed_rejects_a_layer_absent_from_its_high_level_graph() -> None:
 
 
 def test_truth_iteration_and_length_raise_without_nout() -> None:
-    """``bool``/iteration/``len`` on a length-less ``Delayed`` (``:771-789``).
-
-    Each message is compared in full, ``len()``'s trailing parentheses included:
-    the three are the module's whole vocabulary for "this object has no length",
-    and a fragment match cannot tell them apart from a reworded variant.
-    """
     obj = _leaf()
     with pytest.raises(TypeError) as truth:
         bool(obj)
@@ -5278,29 +5100,12 @@ def test_truth_iteration_and_length_raise_without_nout() -> None:
 
 
 def test_dataclass_with_a_set_init_false_field_raises_value_error() -> None:
-    """A set ``init=False`` field cannot be reconstructed (``:270-275``).
-
-    The message names the offending type, so it is rebuilt from the class object
-    and compared in full -- a fragment match would not notice the type being
-    dropped from it, which is the part that makes the error actionable.
-    """
-
     @dataclass
     class ADataClass:
         a: Any
         b: int = field(init=False)
 
     def prepare(a: Any) -> ADataClass:
-        """Build an instance whose ``init=False`` field has been set.
-
-        Args:
-            a: Value for the ordinary field, here a ``Delayed`` so the instance
-                reaches the dataclass branch of ``unpack_collections``.
-
-        Returns:
-            ADataClass: an instance with ``b`` assigned after construction, which
-            is what makes ``replace()`` fail.
-        """
         data = ADataClass(a=a)
         data.b = 4
         return data
@@ -5318,25 +5123,11 @@ def test_dataclass_with_a_set_init_false_field_raises_value_error() -> None:
 
 
 def test_dataclass_with_a_custom_init_raises_type_error() -> None:
-    """A custom ``__init__`` cannot be reconstructed (``:276-280``).
-
-    Compared in full for the same reason as its ``init=False`` sibling, and the
-    two complete messages together prove the branch still discriminates between
-    the two failure modes rather than reporting one for both.
-    """
-
     @dataclass
     class ADataClass:
         a: Any
 
         def __init__(self, b: Any) -> None:
-            """Assign ``b`` to the single field, which ``replace()`` cannot call.
-
-            Args:
-                b: Value stored as ``self.a``. The parameter name deliberately
-                    differs from the field name, so ``replace()`` -- which calls
-                    the constructor with field names -- raises ``TypeError``.
-            """
             self.a = b
 
     with pytest.raises(TypeError) as excinfo:
@@ -5350,11 +5141,6 @@ def test_dataclass_with_a_custom_init_raises_type_error() -> None:
 
 
 def test_private_attribute_access_raises_attribute_error() -> None:
-    """Underscore-prefixed attributes are not lazily wrapped (``:744-745``).
-
-    The attribute name is interpolated into the message, so the whole message is
-    compared: the name is how a user finds the typo that caused it.
-    """
     obj = _leaf()
     with pytest.raises(AttributeError) as excinfo:
         obj._foo
@@ -5362,7 +5148,7 @@ def test_private_attribute_access_raises_attribute_error() -> None:
 
 
 def test_visualise_typo_warns_and_still_returns_a_delayed_attr() -> None:
-    """The ``visualise`` spelling guard warns *and* keeps working (``:747-755``).
+    """The ``visualise`` spelling guard warns *and* keeps working.
 
     Both halves of the guard are asserted: the complete message -- including the
     suggested spelling, which is the entire point of the warning -- and the
@@ -5391,7 +5177,7 @@ def test_visualise_typo_warns_and_still_returns_a_delayed_attr() -> None:
 
 
 def test_to_task_dask_still_warns_and_still_works() -> None:
-    """The deprecated shim keeps its behaviour and its warning (``:335-339``).
+    """The deprecated shim keeps its behaviour and its warning.
 
     ``pytest.warns`` both asserts and consumes the warning, so the test stays
     clean under the project's warnings-as-errors configuration.
@@ -5436,24 +5222,12 @@ def test_to_task_dask_still_warns_and_still_works() -> None:
 
 
 def test_a_task_used_as_a_task_callable_raises() -> None:
-    """Nested task callables are rejected by the task-spec layer.
-
-    ``Task.__init__`` raises when its ``func`` is itself a ``Task``
-    (``dask/_task_spec.py:657-659``), and the error surfaces unchanged through
-    ``call_function`` -- unchanged including its message, which is asserted whole.
-    """
     with pytest.raises(TypeError) as excinfo:
         delayed(Task("t", inc, 1), name="t")(2)
     assert str(excinfo.value) == "Cannot nest tasks"
 
 
 def test_collection_that_does_not_finalize_to_one_key_raises() -> None:
-    """A multi-output collection is refused with the documented message (``:184-189``).
-
-    The message interpolates both the collection's type and its finalized keys
-    (``f"... with {keys=}"``), and both are what tell a user which collection to
-    reduce, so the whole string is compared.
-    """
     a = delayed(1, name="a")
     b = delayed(2, name="b")
     collection = _MultiKeyCollection(
@@ -5473,9 +5247,9 @@ def test_strict_mode_raises_tokenization_error_for_a_generator() -> None:
     A generator falls through ``unpack_collections`` to ``return expr, ()`` and is
     then tokenized by pickle, which fails and routes to
     ``_maybe_raise_nondeterministic`` (``dask/tokenize.py:83-89``), reached from
-    the module-local ``tokenize`` wrapper (``dask/delayed.py:408``). The strict
-    flag is read from the ``_ENSURE_DETERMINISTIC`` ContextVar first and the
-    configuration key second, so ``dask.config.set`` is the right trigger.
+    the module-local ``dask.delayed.tokenize`` wrapper. The strict flag is read
+    from the ``_ENSURE_DETERMINISTIC`` ContextVar first and the configuration key
+    second, so ``dask.config.set`` is the right trigger.
 
     The message names the object that could not be hashed, so the expectation is
     built from that object's own ``repr`` -- the one dynamic value in it -- and
@@ -5497,11 +5271,6 @@ def test_strict_mode_raises_tokenization_error_for_a_generator() -> None:
 
 @pytest.mark.parametrize("name", _STRICT_DETERMINISTIC)
 def test_no_silent_flip_deterministic_stays_deterministic(name: str) -> None:
-    """A deterministically keyed expression keeps its golden key in strict mode.
-
-    Half of the "no silent flip" property: strict mode must not change a key, and
-    in particular must not push a deterministic token onto the UUID fallback.
-    """
     entry = _by_name(name)
     assert entry.deterministic
     with dask.config.set({"tokenize.ensure-deterministic": True}):
@@ -5595,6 +5364,7 @@ def _result_signature(value: Any) -> Any:
         holding the signatures of its elements for a list or a tuple, and the
         value itself for anything else. Only callables need this treatment: they
         compare equal by identity but their ``repr`` varies between processes.
+
     """
     if isinstance(value, tuple):
         return tuple(_result_signature(item) for item in value)
@@ -5620,6 +5390,7 @@ def _computed_exception(obj: Any, scheduler: str) -> BaseException:
         AssertionError: if the computation succeeded. A deliberately non-runnable
             path that quietly became runnable is a behaviour change, so it fails
             here rather than being reported as a pass.
+
     """
     try:
         dask.compute(obj, scheduler=scheduler)
@@ -5717,6 +5488,7 @@ def _assert_round_tripped_result(entry: _Expr, obj: Any, restored: Any) -> None:
     Raises:
         AssertionError: if the restored object's result -- its value, its function
             identity or the exception it raises -- differs from the original's.
+
     """
     if entry.computable:
         assert (
