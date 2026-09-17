@@ -5,8 +5,10 @@ refactor of ``dask/delayed.py``. It locks, for a corpus of delayed expressions
 that reaches every branch of ``dask.delayed.unpack_collections``:
 
 * the generated key strings -- character for character wherever they are
-  deterministic, and structurally (UUID tokens replaced by placeholders) where
-  they are inherently random;
+  deterministic and reproducible, and structurally (the token replaced by a
+  placeholder) where the token is inherently random or, for the twelve entries
+  of ``_ENVIRONMENT_DEPENDENT_KEY_TOKEN``, decided by the environment rather
+  than by the module under test;
 * the canonical, order-independent graph serialization, including the two
   order-sensitive fields ``layer_order`` and ``dependency_order`` -- layer
   insertion order is token-relevant, so it is part of the contract;
@@ -35,10 +37,97 @@ Golden fixture:
     defined in a ``__main__`` module pickle by value as ``__main__.*`` and would
     produce different pickle-sensitive tokens from the ones pytest sees.
 
+Provenance of the golden block:
+    The marker-delimited block was first captured, pre-refactor, in commit
+    ``1cbdf00d3`` -- 81 entries, block sha256 ``6c8c6669d017d741``, unchanged
+    through ``76a0d1ca3``. It was re-emitted once, in ``c771b566e`` -- 90
+    entries, block sha256 ``3e5a9e5f9313ad4f``, unchanged since -- a commit that
+    also modified ``dask/delayed.py``, so the block's git history alone no longer
+    shows the capture predating the first production edit. What the re-emission
+    changed, entry by entry: 9 expressions were added and none removed; of the 81
+    entries the two blocks share, **0** changed their ``key`` and **0** changed
+    their ``result_repr``; all 81 gained the then-new ``stable_graph`` field; and
+    exactly 3 (``attr_v``, ``attr_of_attr``, ``attr_items_getitem``) changed their
+    ``graph``, in one field only -- a legacy-tuple node's dependency list ``[]``
+    became ``['obj']`` because ``canon.py``, in that same commit, began resolving
+    a legacy tuple task's dependencies against the complete low-level graph
+    instead of against one layer's nodes, which is where a ``DelayedAttr`` node's
+    parent actually lives.
+
+    The values are therefore a pre-refactor capture that was re-serialised, not a
+    re-measurement of refactored behaviour, and that is checkable rather than
+    asserted. Three re-verifications, each reproducible from this tree. The first
+    two need a base-commit worktree, built from the repository root as::
+
+        git worktree add <scratch>/base_wt c9d1df34ccba182ddf43c2dbe4315c4d9c8c44e1
+        mkdir -p <scratch>/base_wt/benchmarks/delayed_ab
+        cp dask/_version.py <scratch>/base_wt/dask/_version.py
+        cp benchmarks/delayed_ab/__init__.py benchmarks/delayed_ab/canon.py <scratch>/base_wt/benchmarks/delayed_ab/
+        cp dask/tests/test_delayed_equivalence.py <scratch>/base_wt/dask/tests/
+
+    1. Re-capture against the pre-refactor module, from inside that worktree::
+
+           python -c "from dask.tests.test_delayed_equivalence import write_golden; write_golden()"
+
+       All 90 entries come back field for field identical to the block committed
+       here -- no key, no graph, no ``stable_graph``, no ``result_repr`` differs.
+    2. Run this module, unmodified, against the pre-refactor module, from inside
+       that worktree::
+
+           DASK_DELAYED_BASELINE_ORACLE=1 python -m pytest dask/tests/test_delayed_equivalence.py
+
+       It passes -- 158 passed, 1 skipped, the skip being the gated test below.
+       Every exact key and every raw canonical graph in the block is therefore
+       reproduced *by the baseline module*, which is the property the git history
+       was supposed to show.
+    3. Run the evidence as it stood *before* the re-emission against the current
+       module: restore the module and the canonicaliser of ``76a0d1ca3`` -- the
+       81-entry block, the pre-``stable_graph`` field set -- over a worktree at
+       this branch's head::
+
+           git worktree add --detach <scratch>/head_wt HEAD
+           cp dask/_version.py <scratch>/head_wt/dask/_version.py
+           git -C <scratch>/head_wt checkout 76a0d1ca3 -- dask/tests/test_delayed_equivalence.py benchmarks/delayed_ab/canon.py
+           cd <scratch>/head_wt && python -m pytest dask/tests/test_delayed_equivalence.py
+
+       It passes (118 passed), so the older, provably-pre-refactor values still
+       hold against the refactored module and the re-emission covers no
+       behaviour change.
+
+    A canonicaliser change lands before the first production edit next time, or
+    the fixture is split so a serialization change cannot force a rewrite of
+    behaviour-bearing values.
+
 Portability:
     Deterministic tokens of anything tokenized through pickle depend on which
     optional hash library is installed, so the autouse fixture pins the hasher
     and the two relevant configuration keys. See ``_CONFIG_PINS``.
+
+    The pin reaches every token this module's own builders produce, and two
+    tokens it cannot reach, both recorded in ``_ENVIRONMENT_DEPENDENT_KEY_TOKEN``
+    with the cause: a token frozen when ``dask.delayed`` was *imported* (the
+    operator methods bind ``delayed(op, pure=True)`` at class-binding time), and
+    a dataclass token whose input set is the running interpreter's. Those entries
+    have their own key token -- and only that token, proven minimal by
+    observation -- replaced by a placeholder on both the live and the golden side,
+    exactly as an inherently random UUID token is; every other token, every node
+    kind, every dependency edge, both insertion orders and the computed result
+    stay under verbatim assertion, and the character-for-character comparison
+    still runs wherever the environment reproduces the capture
+    (``test_environment_dependent_key_tokens_match_the_golden_where_reproducible``).
+
+Pre-refactor oracle run:
+    Re-running this module against the pre-refactor module (re-verification 2
+    above) needs one environment variable::
+
+        DASK_DELAYED_BASELINE_ORACLE=1 pytest dask/tests/test_delayed_equivalence.py
+
+    It skips the single test whose chain length is only affordable on the
+    refactored construction path -- see
+    ``test_chain_at_and_past_the_ancestor_bound_matches_the_generic_path`` -- and
+    nothing else. Without it that test cannot terminate on the baseline, and
+    because the project runs ``timeout_method = "thread"`` a 300 s hit takes the
+    whole session down rather than the one test.
 
 Notes:
     The canonicaliser is imported from ``benchmarks/delayed_ab/canon.py`` and is
@@ -52,8 +141,11 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import operator
+import os
 import pickle
 import pprint
+import sys
 import types
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -70,6 +162,7 @@ from dask.base import collections_to_expr
 from dask.delayed import (
     Delayed,
     DelayedAttr,
+    DelayedLeaf,
     delayed,
     finalize,
     to_task_dask,
@@ -108,6 +201,57 @@ _CONFIG_PINS: dict[str, Any] = {
     "delayed_pure": False,
 }
 
+#: The hash library ``dask.hashing`` selected in *this* process, read here at
+#: import time and therefore before any fixture can pin it. It is the state
+#: ``dask.delayed`` itself was imported under, which is what decides the two
+#: tokens the pin cannot reach (see ``_ENVIRONMENT_DEPENDENT_KEY_TOKEN``).
+_AMBIENT_HASHER: str = dask.hashing.hashers[0].__name__
+
+#: The same reading, taken in the environment the golden block was captured in:
+#: the locked ``pixi`` ``default`` environment, CPython 3.14.6 with
+#: ``python-xxhash`` and ``mmh3`` installed and ``python-cityhash`` absent.
+_CAPTURE_HASHER = "_hash_xxhash"
+
+#: The interpreter the golden block was captured on.
+_CAPTURE_PYTHON = (3, 14)
+
+#: ``_DataclassParams.__slots__`` as the capture interpreter declared it.
+#: ``dask.tokenize`` normalises a dataclass instance by reading every attribute
+#: this tuple names, so its membership -- fixed by the interpreter, not by dask --
+#: is an input to every dataclass token. CPython 3.10 declares the first six only.
+_CAPTURE_DATACLASS_PARAM_SLOTS = (
+    "init",
+    "repr",
+    "eq",
+    "order",
+    "unsafe_hash",
+    "frozen",
+    "match_args",
+    "kw_only",
+    "slots",
+    "weakref_slot",
+)
+
+# Both predicates are declared ``bool`` rather than left as the comparison
+# expressions: a bare ``sys.version_info`` comparison is folded by mypy against
+# the configured 3.10 baseline, which would make every branch guarded by it
+# unreachable and trip ``warn_unreachable``.
+#: Whether this environment reproduces the import-time tokens of the capture.
+_HASHER_REPRODUCES_CAPTURE: bool = _AMBIENT_HASHER == _CAPTURE_HASHER
+#: Whether this environment reproduces the dataclass tokens of the capture.
+_INTERPRETER_REPRODUCES_CAPTURE: bool = sys.version_info[:2] == _CAPTURE_PYTHON
+
+#: Environment variable that switches this module into pre-refactor-oracle mode,
+#: where it is run against the baseline ``dask/delayed.py`` in a base-commit
+#: worktree. It gates exactly one test, whose cost on the pre-refactor
+#: construction path is exponential in the chain length it needs; see the
+#: "Pre-refactor oracle run" section of the module docstring.
+_BASELINE_ORACLE_ENV = "DASK_DELAYED_BASELINE_ORACLE"
+
+#: True when the variable is set to exactly ``"1"``, so an accidental ``"0"``,
+#: ``"true"`` or empty value leaves the full module running.
+_BASELINE_ORACLE: bool = os.environ.get(_BASELINE_ORACLE_ENV) == "1"
+
 
 @pytest.fixture(autouse=True)
 def _pin_tokenization(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
@@ -125,6 +269,14 @@ def _pin_tokenization(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     Patching works -- and no edit to ``dask/hashing.py`` is needed -- because
     ``hash_buffer`` iterates the *module-level* ``hashers`` list at call time
     (``dask/hashing.py:86``), not at import time.
+
+    What the pin does **not** reach is a token computed before it exists. The
+    operator methods of ``Delayed`` are bound while the class is built, and each
+    binding tokenizes its operator function under whichever library was ambient
+    when ``dask.delayed`` was imported; a dataclass token, separately, is
+    computed from inputs the interpreter decides. Those two are handled by
+    ``_ENVIRONMENT_DEPENDENT_KEY_TOKEN`` rather than by this fixture, which
+    cannot see them.
 
     Every mutation is reverted: ``monkeypatch`` restores the list and the
     ``dask.config.set`` context restores the configuration, so the module leaves
@@ -999,6 +1151,91 @@ _BRANCH_COVERAGE: dict[str, str] = {
     "namedtuple holding a collection (:283-291)": "arg_namedtuple_with_delayed",
     "fall-through, object returned unchanged (:293)": "arg_int",
 }
+
+
+class _TokenCause(NamedTuple):
+    """One reason a deterministic key token is not comparable verbatim everywhere.
+
+    Attributes:
+        reproduces_capture: True when this environment produces the very token
+            the golden recorded, so the character-for-character comparison is
+            valid here and is still made.
+        reason: What decides the token and why this environment does or does not
+            reproduce it. Used verbatim as a skip reason, so it has to read on
+            its own in a ``-rs`` summary.
+
+    """
+
+    reproduces_capture: bool
+    reason: str
+
+
+#: The two causes, each a property of the environment rather than of the module
+#: under test. Neither is reachable by ``_pin_tokenization``: the first is fixed
+#: before any fixture runs, the second by the interpreter the suite runs on.
+_TOKEN_CAUSES: dict[str, _TokenCause] = {
+    "import-time-hasher": _TokenCause(
+        _HASHER_REPRODUCES_CAPTURE,
+        f"dask.hashing selected {_AMBIENT_HASHER} in this process and the golden was "
+        f"captured under {_CAPTURE_HASHER}; Delayed binds its operator methods to "
+        "delayed(op, pure=True) at class-binding time, so the leaf token those keys "
+        "derive from is fixed when dask.delayed is imported, before any fixture can "
+        "pin the hasher",
+    ),
+    "interpreter-dataclass": _TokenCause(
+        _INTERPRETER_REPRODUCES_CAPTURE,
+        f"this is CPython {sys.version_info[0]}.{sys.version_info[1]} and the golden "
+        f"was captured on {_CAPTURE_PYTHON[0]}.{_CAPTURE_PYTHON[1]}; dask tokenizes a "
+        "dataclass instance from every attribute __dataclass_params__ declares, and "
+        "the interpreter decides that set (six names on 3.10, ten on 3.14)",
+    ),
+}
+
+#: Corpus entries whose *own* key token is decided by the environment, mapped to
+#: the cause in ``_TOKEN_CAUSES``.
+#:
+#: Ten of them reach ``call_function`` through a class-bound operator --
+#: ``Delayed._get_binary_operator`` evaluates ``delayed(op, pure=True)`` while the
+#: class body is being built, so that leaf's key is tokenized under whichever hash
+#: library ``dask.hashing`` had selected when ``dask.delayed`` was imported. The
+#: leaf never enters the graph; it is passed as ``func_token`` and tokenized into
+#: the call key
+#: (``dask/delayed.py``), which is why the import-time state reaches exactly one
+#: token and no other. ``op_getitem``, ``attr_items_getitem`` and the four
+#: ``nout_*`` element entries are on that list because indexing and unpacking a
+#: ``Delayed`` route through the class-bound ``operator.getitem`` too.
+#:
+#: The other two tokenize a dataclass instance, whose normalisation reads the
+#: interpreter's own ``__dataclass_params__`` slot set.
+#:
+#: The masking these entries receive is one token wide, and that it is enough was
+#: established by observation rather than by argument: built under the two
+#: extremes this project supports -- CPython 3.14.6 with ``xxhash`` ambient, and
+#: CPython 3.10.20 with SHA-1 ambient, ``mmh3`` ambient checked as a third -- each
+#: of these twelve graphs differs in exactly one 32-hex token, its own output
+#: key's, and replacing that one token makes the canonical dicts equal field for
+#: field. Every other token in them, the leaf keys and the ``getattr-`` tokens
+#: included, is produced under the fixture's pin and is compared verbatim.
+_ENVIRONMENT_DEPENDENT_KEY_TOKEN: dict[str, str] = {
+    "op_add": "import-time-hasher",
+    "op_reflected_add": "import-time-hasher",
+    "op_neg": "import-time-hasher",
+    "op_lt": "import-time-hasher",
+    "op_getitem": "import-time-hasher",
+    "attr_items_getitem": "import-time-hasher",
+    "nout_one_element": "import-time-hasher",
+    "nout_two_unpacked_first": "import-time-hasher",
+    "nout_two_unpacked_second": "import-time-hasher",
+    "nout_two_getitem_one": "import-time-hasher",
+    "arg_dataclass_literal": "interpreter-dataclass",
+    "arg_dataclass_with_delayed": "interpreter-dataclass",
+}
+
+#: What an environment-dependent token is replaced by. It contains characters no
+#: generated key can hold, so a masked form can never be mistaken for a real one,
+#: and it is distinct from ``_stable_graph``'s ``<hex0>`` placeholders, which
+#: stand for inherently *random* tokens rather than environment-dependent ones.
+_ENV_TOKEN_PLACEHOLDER = "<env-token>"
 
 
 def _by_name(name: str) -> _Expr:
@@ -4081,6 +4318,71 @@ def _stable_graph(entry: _Expr) -> dict[str, Any]:
     return normalised
 
 
+def _hex_key_token(name: str, key: object) -> str:
+    """Return the deterministic 32-hex token of a generated key.
+
+    Args:
+        name: The corpus entry the key belongs to, for the failure message.
+        key: The key to split at its last ``"-"``.
+
+    Returns:
+        str: the token following that hyphen.
+
+    Raises:
+        AssertionError: if the key is not a ``str`` carrying a prefix and a
+            32-hex token. Refusing is the point: an environment-dependent entry
+            whose token has stopped being a deterministic digest -- a UUID
+            fallback above all -- must fail here rather than be masked into
+            agreement with the golden.
+
+    """
+    assert isinstance(key, str), f"{name}: expected a str key, got {type(key).__name__}"
+    prefix, _, token = key.rpartition("-")
+    assert prefix, f"{name}: key {key!r} carries no prefix"
+    assert len(token) == _HEX_TOKEN_LEN and _HEX_DIGITS.issuperset(
+        token
+    ), f"{name}: key {key!r} does not end in a deterministic 32-hex token"
+    return token
+
+
+def _token_masker(name: str, key: object) -> Callable[[Any], Any]:
+    """Return the transform that makes one entry's canonical forms portable.
+
+    For all but the entries registered in ``_ENVIRONMENT_DEPENDENT_KEY_TOKEN``
+    this is the identity, so their keys and graphs stay under verbatim
+    comparison. For a registered entry it replaces that entry's own key token --
+    one token, and only where it occurs -- with ``_ENV_TOKEN_PLACEHOLDER``.
+    Applying it to the live form with the live key and to the golden form with
+    the golden key leaves the two comparable on any interpreter and under any
+    installed hash library, while every other token in both forms is still
+    compared as it stands.
+
+    Args:
+        name: Corpus entry name, looked up in the registry.
+        key: The key whose token is to be masked -- the live key for a live
+            form, the golden key for a golden form.
+
+    Returns:
+        Callable: a transform over a canonical form (a ``dict``, a ``list`` or a
+        bare key), returning the same structure with nothing but that token
+        replaced.
+
+    """
+    if name not in _ENVIRONMENT_DEPENDENT_KEY_TOKEN:
+
+        def keep(form: Any) -> Any:
+            return form
+
+        return keep
+
+    replacements = {_hex_key_token(name, key): _ENV_TOKEN_PLACEHOLDER}
+
+    def mask(form: Any) -> Any:
+        return _substitute(form, replacements)
+
+    return mask
+
+
 def _golden_names(names: Sequence[Any]) -> list[Any]:
     """Live graph names in the form the canonical golden fields record them.
 
@@ -4227,33 +4529,59 @@ def test_characterisation(entry: _Expr) -> None:
             ``GOLDEN[entry.name]``, which was captured before the refactor and is
             never regenerated to make this test pass.
 
+    An entry listed in ``_ENVIRONMENT_DEPENDENT_KEY_TOKEN`` is compared with its
+    own key token masked on both sides, because that one token is decided by the
+    environment rather than by the module under test; everything else about it,
+    this test's own graph and result comparisons included, is compared as it
+    stands, and the unmasked key is asserted by
+    ``test_environment_dependent_key_tokens_match_the_golden_where_reproducible``
+    wherever the environment can reproduce it.
+
     """
     golden = GOLDEN[entry.name]
     obj = entry.build()
     table: dict[str, str] = {}
     normalised_key = normalize_key(obj.key, table)
+    # The identity transform for every entry but the twelve whose own key token
+    # the environment decides rather than the module under test. For those, the
+    # live form is masked with the token this environment produced and the golden
+    # form with the token the capture recorded, so the two are compared in the
+    # only form that is portable -- see ``_ENVIRONMENT_DEPENDENT_KEY_TOKEN``.
+    mask_live = _token_masker(entry.name, obj.key)
+    mask_golden = _token_masker(entry.name, golden["key"])
 
     if entry.deterministic:
         # Character for character, 32-hex token included: a deterministic token is
         # part of the contract because ``pure=True`` shares work by key identity,
         # so a changed token silently changes which nodes are deduplicated.
-        assert obj.key == golden["key"]
+        assert mask_live(obj.key) == mask_golden(golden["key"])
+        if entry.name in _ENVIRONMENT_DEPENDENT_KEY_TOKEN:
+            # Two properties of the masked token that the golden can no longer
+            # pin here, both asserted instead: it is still a deterministic digest
+            # rather than a UUID fallback (``_hex_key_token``, inside the masker,
+            # refuses anything else), and it reproduces across builds, which is
+            # what sharing by key identity under ``pure=True`` rests on. Its
+            # exact value is asserted against the golden wherever the environment
+            # can reproduce it, by
+            # ``test_environment_dependent_key_tokens_match_the_golden_where_reproducible``.
+            assert entry.build().key == obj.key
     else:
         assert obj.key != golden["key"], "a UUID token must not equal its placeholder"
-    assert normalised_key == golden["key"]
+    assert mask_live(normalised_key) == mask_golden(golden["key"])
 
     if entry.canonical:
-        graph = canonical_graph(obj)
+        graph = mask_live(canonical_graph(obj))
+        expected = mask_golden(golden["graph"])
         # Field by field first, so a failure names the property that moved, then
         # as a whole, so nothing outside those fields can drift unnoticed.
-        assert graph["key"] == golden["graph"]["key"]
-        assert graph["dask_keys"] == golden["graph"]["dask_keys"]
-        assert graph["dask_layers"] == golden["graph"]["dask_layers"]
-        assert graph["layer_order"] == golden["graph"]["layer_order"]
-        assert graph["dependency_order"] == golden["graph"]["dependency_order"]
-        assert graph["layers"] == golden["graph"]["layers"]
-        assert graph["dependencies"] == golden["graph"]["dependencies"]
-        assert graph == golden["graph"]
+        assert graph["key"] == expected["key"]
+        assert graph["dask_keys"] == expected["dask_keys"]
+        assert graph["dask_layers"] == expected["dask_layers"]
+        assert graph["layer_order"] == expected["layer_order"]
+        assert graph["dependency_order"] == expected["dependency_order"]
+        assert graph["layers"] == expected["layers"]
+        assert graph["dependencies"] == expected["dependencies"]
+        assert graph == expected
 
         materialised = obj.__dask_graph__()
         assert isinstance(materialised, HighLevelGraph)
@@ -4265,19 +4593,20 @@ def test_characterisation(entry: _Expr) -> None:
             # graphs with identical content in a different order tokenize
             # differently wherever a ``Delayed`` is reached through pickle.
             assert (
-                _golden_names(list(materialised.layers))
-                == golden["graph"]["layer_order"]
+                mask_live(_golden_names(list(materialised.layers)))
+                == expected["layer_order"]
             )
             assert (
-                _golden_names(list(materialised.dependencies))
-                == golden["graph"]["dependency_order"]
+                mask_live(_golden_names(list(materialised.dependencies)))
+                == expected["dependency_order"]
             )
             assert (
-                _golden_names(list(obj.__dask_keys__())) == golden["graph"]["dask_keys"]
+                mask_live(_golden_names(list(obj.__dask_keys__())))
+                == expected["dask_keys"]
             )
             assert (
-                _golden_names(list(obj.__dask_layers__()))
-                == golden["graph"]["dask_layers"]
+                mask_live(_golden_names(list(obj.__dask_layers__())))
+                == expected["dask_layers"]
             )
     else:
         assert golden["graph"] is None
@@ -4309,6 +4638,144 @@ def test_characterisation(entry: _Expr) -> None:
     else:
         assert golden["result_repr"] is None
         assert entry.name in _EXCLUSION_REASONS
+
+
+@pytest.mark.parametrize("name", sorted(_ENVIRONMENT_DEPENDENT_KEY_TOKEN))
+def test_environment_dependent_key_tokens_match_the_golden_where_reproducible(
+    name: str,
+) -> None:
+    """Assert the verbatim golden for a masked entry wherever that is possible.
+
+    ``test_characterisation`` compares these twelve entries with their own key
+    token masked, because nothing this module can pin decides that token. The
+    relaxation is not a licence: wherever the environment reproduces the capture
+    -- the same ambient hash library for the import-time cause, the same
+    interpreter for the dataclass cause -- the exact key string and the raw
+    canonical graph are asserted here, so the character-for-character evidence
+    AAP §0.5.1 asks for still runs, and an entry masked without cause fails here
+    instead of passing quietly.
+
+    Args:
+        name: A corpus entry registered in ``_ENVIRONMENT_DEPENDENT_KEY_TOKEN``.
+
+    """
+    cause = _TOKEN_CAUSES[_ENVIRONMENT_DEPENDENT_KEY_TOKEN[name]]
+    if not cause.reproduces_capture:
+        pytest.skip(cause.reason)
+    entry = _by_name(name)
+    obj = entry.build()
+    assert obj.key == GOLDEN[name]["key"]
+    assert canonical_graph(obj) == GOLDEN[name]["graph"]
+
+
+def test_a_token_the_masker_cannot_split_is_refused_rather_than_masked() -> None:
+    """The masker refuses anything but a deterministic 32-hex token.
+
+    This is the property that keeps the relaxation from swallowing a regression.
+    A masked entry whose token stopped being a deterministic digest -- a UUID
+    fallback from a lost ``pure=True``, a key with no token at all, a
+    non-``str`` key -- would otherwise be masked into agreement with the golden
+    and pass. Each of those inputs fails instead.
+    """
+    with pytest.raises(AssertionError, match="expected a str key"):
+        _hex_key_token("op_add", ("tk", 0))
+    with pytest.raises(AssertionError, match="carries no prefix"):
+        _hex_key_token("op_add", "nohyphen")
+    with pytest.raises(AssertionError, match="does not end in a deterministic"):
+        _hex_key_token("op_add", "add-2f4c1e1a-9b2e-4d0a-8f7c-1a2b3c4d5e6f")
+    with pytest.raises(AssertionError, match="does not end in a deterministic"):
+        _hex_key_token("op_add", "add-notahexdigestatall")
+    # And the accepting side, so the guard is not merely strict: the golden key
+    # of a masked entry splits into its prefix and its 32-hex token.
+    golden_key = GOLDEN["op_add"]["key"]
+    assert golden_key == f"add-{_hex_key_token('op_add', golden_key)}"
+
+
+def test_environment_dependent_entries_are_justified_corpus_entries() -> None:
+    """The masking registry names real entries, with a real cause, and masks one token.
+
+    Three properties, each of which a careless addition to the registry would
+    break: a registered name is a deterministically-keyed corpus entry with a
+    golden key the masker can split; every cause named is one of the two defined;
+    and masking actually changes the form it is applied to -- a mask that matched
+    nothing would compare two unmasked forms and quietly reintroduce the
+    portability failure it exists to fix.
+    """
+    assert set(_TOKEN_CAUSES) == set(_ENVIRONMENT_DEPENDENT_KEY_TOKEN.values()), (
+        "every defined cause must be in use and every cause in use must be defined: "
+        f"defined={sorted(_TOKEN_CAUSES)}, "
+        f"used={sorted(set(_ENVIRONMENT_DEPENDENT_KEY_TOKEN.values()))}"
+    )
+    for name, cause in sorted(_ENVIRONMENT_DEPENDENT_KEY_TOKEN.items()):
+        # ``_by_name`` raises if the registry names something the corpus does not.
+        entry = _by_name(name)
+        assert cause in _TOKEN_CAUSES, name
+        assert entry.deterministic, f"{name}: only a deterministic token is masked"
+        assert not entry.volatile_tokens, f"{name}: a random token is handled already"
+        golden_key = GOLDEN[name]["key"]
+        masked = _token_masker(name, golden_key)(golden_key)
+        prefix = golden_key.rpartition("-")[0]
+        assert masked == f"{prefix}-{_ENV_TOKEN_PLACEHOLDER}", name
+        assert masked != golden_key, name
+
+
+def test_operator_method_leaf_keys_are_fixed_when_dask_delayed_is_imported() -> None:
+    """The hasher pin cannot reach an operator method's leaf key.
+
+    ``Delayed._get_binary_operator`` evaluates ``delayed(op, pure=True)`` while
+    the class is being built, so that leaf's key -- which tokenizes the operator
+    function through pickle, and therefore through ``dask.hashing.hashers[0]`` --
+    is fixed when ``dask.delayed`` is imported, before any fixture exists to pin
+    the hasher. The leaf itself never enters a graph: it is handed to
+    ``call_function`` as ``func_token`` and tokenized into the call key, which is
+    why the import-time state reaches exactly one token of the resulting graph
+    and no other.
+
+    That is the whole of the ``"import-time-hasher"`` cause, asserted rather than
+    described: the leaf the class holds agrees with one rebuilt under the pin
+    exactly when the ambient hasher already was the pinned one.
+    """
+    # ``_bind_operator`` installs the method with ``setattr``, so the class's own
+    # ``__dict__`` is where it lives; subscripting avoids both a dynamic-attribute
+    # type error and a constant ``getattr``.
+    bound = Delayed.__dict__["__add__"]
+    closure = bound.__closure__
+    assert closure is not None, "Delayed.__add__ no longer closes over its leaf"
+    assert len(closure) == 1, f"expected one closure cell, got {len(closure)}"
+    leaf = closure[0].cell_contents
+    assert type(leaf) is DelayedLeaf
+
+    rebuilt = delayed(operator.add, pure=True)
+    assert type(rebuilt) is DelayedLeaf
+    assert (leaf.key == rebuilt.key) == (
+        _AMBIENT_HASHER == dask.hashing._hash_sha1.__name__
+    ), (
+        f"the class-bound operator leaf {leaf.key!r} and a leaf rebuilt under the "
+        f"SHA-1 pin {rebuilt.key!r} may agree only where the ambient hasher "
+        f"({_AMBIENT_HASHER}) is the pinned one"
+    )
+
+
+def test_a_dataclass_key_token_takes_one_input_per_declared_dataclass_param() -> None:
+    """A dataclass token's input set is the interpreter's, not dask's.
+
+    ``dask.tokenize`` normalises a dataclass instance by reading every attribute
+    ``__dataclass_params__`` declares (``dask/tokenize.py``'s
+    ``_normalize_dataclass``), so the identity and number of those attributes are
+    inputs to the token -- and CPython decides them, and has changed them: six
+    names on 3.10, ten on 3.14. That is the whole of the
+    ``"interpreter-dataclass"`` cause, and it is independent of the hasher: under
+    the same SHA-1 pin the ``arg_dataclass_*`` entries reproduce their captured
+    tokens on the capture interpreter and cannot on another.
+    """
+    # The class attribute dask reads, taken from the class ``__dict__`` because
+    # typeshed's dataclass protocol declares only ``__dataclass_fields__``.
+    params = Box.__dict__["__dataclass_params__"]
+    slots = tuple(params.__slots__)
+    # The six every supported interpreter declares, in the order dask reads them.
+    assert slots[:6] == ("init", "repr", "eq", "order", "unsafe_hash", "frozen")
+    if _INTERPRETER_REPRODUCES_CAPTURE:
+        assert slots == _CAPTURE_DATACLASS_PARAM_SLOTS
 
 
 def test_delayed_of_a_delayed_returns_the_same_object() -> None:
@@ -5348,7 +5815,14 @@ def test_no_silent_flip_deterministic_stays_deterministic(name: str) -> None:
     assert entry.deterministic
     with dask.config.set({"tokenize.ensure-deterministic": True}):
         obj = entry.build()
-    assert obj.key == GOLDEN[name]["key"]
+    # Strict mode may not change the key at all, which is asserted twice over:
+    # against the same expression built outside strict mode -- portable, and the
+    # property itself -- and against the golden, masked for the two entries whose
+    # own token the environment decides rather than the module under test.
+    assert obj.key == entry.build().key
+    mask_live = _token_masker(name, obj.key)
+    mask_golden = _token_masker(name, GOLDEN[name]["key"])
+    assert mask_live(obj.key) == mask_golden(GOLDEN[name]["key"])
 
 
 def test_no_silent_flip_nondeterministic_stays_nondeterministic() -> None:
@@ -5639,7 +6113,13 @@ def test_objects_and_graphs_round_trip_through_pickle() -> None:
             # ``_name``; there is no ``layers`` mapping to compare.
             assert restored_graph._name == graph._name, entry.name
         if entry.canonical:
-            assert canonical_graph(restored) == GOLDEN[entry.name]["graph"], entry.name
+            # ``restored.key == obj.key`` is asserted just above, so the live
+            # token is the right one to mask on the restored side too.
+            mask_live = _token_masker(entry.name, obj.key)
+            mask_golden = _token_masker(entry.name, GOLDEN[entry.name]["key"])
+            assert mask_live(canonical_graph(restored)) == mask_golden(
+                GOLDEN[entry.name]["graph"]
+            ), entry.name
         _assert_round_tripped_result(entry, obj, restored)
 
 
@@ -5722,6 +6202,14 @@ def test_a_cyclic_attribute_chain_is_bounded_rather_than_walked_forever() -> Non
     assert canonical_result([delayed(ident, name="ident")(1, 2)]) == ((1, 2),)
 
 
+@pytest.mark.skipif(
+    _BASELINE_ORACLE,
+    reason=(
+        f"{_BASELINE_ORACLE_ENV}=1: the pre-refactor module builds a dependency's "
+        "graph twice per level, so this test's chain costs 2**links graph builds "
+        "there and cannot terminate"
+    ),
+)
 def test_chain_at_and_past_the_ancestor_bound_matches_the_generic_path() -> None:
     """Either side of the ancestor bound builds the generic path's graph.
 
@@ -5740,6 +6228,13 @@ def test_chain_at_and_past_the_ancestor_bound_matches_the_generic_path() -> None
     links is what ``attr_v``/``attr_of_attr`` compare against the golden, and
     ``test_attribute_chain_over_an_unsafe_ancestor_reprs_its_key_as_today`` pins
     the side-effect counts those levels perform.
+
+    For the same reason this is the one test that cannot run in the pre-refactor
+    oracle run, where the whole module is executed against the baseline module in
+    a base-commit worktree: it would hold the interpreter until the 300 s
+    ``timeout_method = "thread"`` limit, which takes the whole session down
+    rather than the one test. Setting ``DASK_DELAYED_BASELINE_ORACLE=1`` skips it
+    and nothing else, which makes that run mechanical; see the module docstring.
     """
     for links in (_ANCESTOR_BOUND, _ANCESTOR_BOUND + 1):
         value = _SelfAttribute()

@@ -432,48 +432,60 @@ def unpack_collections(expr, _return_collections=True):
     ):
         return expr, ()
 
-    if isinstance(expr, Delayed):
-        if _return_collections:
-            return TaskRef(expr._key), (expr,)
-        else:
-            expr = collections_to_expr(expr).finalize_compute()
-            (name,) = expr.__dask_keys__()
-            return TaskRef(name), (expr,)
+    # The three probes below are provably dead for a container of exactly one of
+    # the built-in types the branches further down dispatch on, by the same
+    # reasoning the scalar fast path above records: such a value is never a
+    # ``Delayed`` (a ``Delayed`` is never exactly a ``list``/``tuple``/``set``/
+    # ``dict``, and ``isinstance`` resolves through ``type.__instancecheck__``,
+    # never user code); it can never be any other dask collection either, because
+    # a built-in type cannot acquire a ``__dask_graph__`` attribute and a built-in
+    # container instance carries no ``__dict__`` to hold one; and it is no
+    # iterator, so none of the three coercions can match. Skipping them for the
+    # exact types changes no decision - a subclass of ``list`` and every other
+    # type still takes the full cascade.
+    if typ is not list and typ is not tuple and typ is not set and typ is not dict:
+        if isinstance(expr, Delayed):
+            if _return_collections:
+                return TaskRef(expr._key), (expr,)
+            else:
+                expr = collections_to_expr(expr).finalize_compute()
+                (name,) = expr.__dask_keys__()
+                return TaskRef(name), (expr,)
 
-    # FIXME: Make this not trigger materialization
-    # Currently this is checking with hasattr for __dask_graph__ which triggers
-    # a materialization
-    if base.is_dask_collection(expr):
-        if _return_collections:
-            expr2 = ProhibitReuse(collections_to_expr(expr).finalize_compute())
-            finalized = expr2.optimize()
-            # FIXME: Make this also go away
-            dsk = finalized.__dask_graph__()
-            keys = list(flatten(finalized.__dask_keys__()))
-            if len(keys) > 1:
-                # `finalize_compute` _should_ guarantee that we only have one key
-                raise RuntimeError(
-                    "Cannot unpack dask collections which don't finalize to a "
-                    f"single key. Got {type(expr)} with {keys=}",
-                )
+        # FIXME: Make this not trigger materialization
+        # Currently this is checking with hasattr for __dask_graph__ which triggers
+        # a materialization
+        if base.is_dask_collection(expr):
+            if _return_collections:
+                expr2 = ProhibitReuse(collections_to_expr(expr).finalize_compute())
+                finalized = expr2.optimize()
+                # FIXME: Make this also go away
+                dsk = finalized.__dask_graph__()
+                keys = list(flatten(finalized.__dask_keys__()))
+                if len(keys) > 1:
+                    # `finalize_compute` _should_ guarantee that we only have one key
+                    raise RuntimeError(
+                        "Cannot unpack dask collections which don't finalize to a "
+                        f"single key. Got {type(expr)} with {keys=}",
+                    )
 
-            return unpack_collections(Delayed(keys[0], dsk))
-        else:
-            expr = collections_to_expr(expr).finalize_compute()
-            (name,) = expr.__dask_keys__()
-            return TaskRef(name), (expr,)
+                return unpack_collections(Delayed(keys[0], dsk))
+            else:
+                expr = collections_to_expr(expr).finalize_compute()
+                (name,) = expr.__dask_keys__()
+                return TaskRef(name), (expr,)
 
-    # Iterators are materialized into the container they iterate over. ``typ``
-    # is read once above, so each coercion has to update it too.
-    if typ is _LIST_ITER_TYPE:
-        expr = list(expr)
-        typ = list
-    elif typ is _TUPLE_ITER_TYPE:
-        expr = tuple(expr)
-        typ = tuple
-    elif typ is _SET_ITER_TYPE:
-        expr = set(expr)
-        typ = set
+        # Iterators are materialized into the container they iterate over. ``typ``
+        # is read once above, so each coercion has to update it too.
+        if typ is _LIST_ITER_TYPE:
+            expr = list(expr)
+            typ = list
+        elif typ is _TUPLE_ITER_TYPE:
+            expr = tuple(expr)
+            typ = tuple
+        elif typ is _SET_ITER_TYPE:
+            expr = set(expr)
+            typ = set
 
     if typ in _SEQUENCE_TYPES:
         args: list = []
@@ -482,10 +494,18 @@ def unpack_collections(expr, _return_collections=True):
         # element of every container the traversal reaches.
         append_arg = args.append
         extend_collections = collections.extend
+        # ``verbatim`` stays true while every element has come back from the
+        # recursion as the very object that went in and is itself no task-spec
+        # node - the condition under which the container as a whole can carry no
+        # dependency (see the shortcut below).
+        verbatim = True
         for e in expr:
             arg, subcollections = unpack_collections(e, _return_collections=False)
             append_arg(arg)
-            extend_collections(subcollections)
+            if subcollections:
+                extend_collections(subcollections)
+            elif verbatim and (arg is not e or isinstance(arg, (TaskRef, GraphNode))):
+                verbatim = False
         if len(collections) > 1:
             # De-duplicate by identity, first occurrence winning and the order
             # being that of first appearance - exactly ``unique(..., key=id)``.
@@ -498,10 +518,30 @@ def unpack_collections(expr, _return_collections=True):
         # Every branch hands back a tuple of collections, including the
         # short-circuits below, so that callers can concatenate them.
         collections = tuple(collections)
-        # Built for every container, including one whose elements all came back
-        # from the recursion unchanged: ``NestedContainer.__init__`` unwraps a
-        # lone ``list`` argument, and only that unwrapping surfaces a ``TaskRef``
-        # held by a ``list`` subclass the exact-type dispatch left atomic.
+        # A container that found no collection and whose elements all came back
+        # from the recursion untouched cannot contribute a dependency, so the
+        # ``List`` built from it would be discarded again by the short-circuit
+        # below - constructing it first is pure cost on the hottest path in the
+        # module. Every branch of this function returns a task-spec node only when
+        # that node has non-empty dependencies (each branch's own short-circuit
+        # guarantees it), which is what makes "unchanged element" and "no
+        # dependency" the same statement here; an element that is itself a bare
+        # ``TaskRef`` or ``GraphNode`` also comes back unchanged and is excluded by
+        # ``verbatim`` above. The one remaining way the construction can surface a
+        # dependency is ``NestedContainer.__init__`` replacing its arguments with
+        # its single ``list`` argument [dask/_task_spec.py:851-853], which is the
+        # only thing that reveals a ``TaskRef`` held by a ``list`` subclass element
+        # the exact-type dispatch left atomic - so that shape stays on the
+        # constructing path. ``Task.__init__`` runs no user code over its
+        # arguments (only ``isinstance`` checks against ``TaskRef``/``GraphNode``),
+        # so a construction skipped here is unobservable and the returned
+        # ``(task, collections)`` pair is the same pair as before.
+        if (
+            verbatim
+            and not collections
+            and not (len(args) == 1 and isinstance(args[0], list))
+        ):
+            return expr, ()
         # The List constructor also checks for futures
         args = List(*args)
         if not collections and not args.dependencies:
@@ -516,13 +556,22 @@ def unpack_collections(expr, _return_collections=True):
     if typ is dict:
         if not expr:
             return expr, ()
-        keyargs, kcollections = unpack_collections(
-            list(expr.keys()), _return_collections=False
-        )
+        # Bound to locals so the identity test below can ask whether the two
+        # recursions handed the very lists back - the list branch returns its
+        # argument unchanged exactly when that list carries no dependency.
+        keyseq = list(expr.keys())
+        valueseq = list(expr.values())
+        keyargs, kcollections = unpack_collections(keyseq, _return_collections=False)
         valargs, valcollections = unpack_collections(
-            list(expr.values()), _return_collections=False
+            valueseq, _return_collections=False
         )
         collections = kcollections + valcollections
+        # Same reasoning as the sequence branch: with no collections found and
+        # both halves returned verbatim, ``Dict`` - which flattens the pairs into
+        # its arguments - can hold no dependency either, so it would be built only
+        # to be thrown away by the short-circuit below.
+        if not collections and keyargs is keyseq and valargs is valueseq:
+            return expr, ()
         args = Dict([[k, v] for k, v in zip(keyargs, valargs)])
         if not collections and not args.dependencies:
             return expr, ()
