@@ -101,6 +101,15 @@ class Obj:
     """
 
     def __init__(self, v: int) -> None:
+        """Initialise the instance's ``v`` attribute and its ``items`` list.
+
+        Args:
+            v: The integer the instance carries. It is stored on ``v``, which
+                ``attr_and_operators`` reads back through the delayed attribute access
+                ``o.v`` and which ``meth`` adds its argument to, and it seeds ``items``
+                with the three consecutive integers ``[v, v + 1, v + 2]`` that the same
+                case indexes as ``o.items[1]``.
+        """
         self.v = v
         self.items = [v, v + 1, v + 2]
 

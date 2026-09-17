@@ -101,7 +101,7 @@ _EXIT_GATE_FAIL = 1
 _EXIT_EQUIVALENCE = 2
 _EXIT_DIRTY = 3
 
-#: The verdict string ``build_payload`` writes when every gate item held.
+#: The verdict string ``_build_payload`` writes when every gate item held.
 _PASS_VERDICT = "PASS"
 
 #: The gate's thresholds, as fixed before any measurement was taken. They are
@@ -409,6 +409,10 @@ def _peak_bytes(case: dict[str, Any], arm: str, *, name: str, report: str) -> fl
     under their own definitions and are never read as a peak block count, which
     ``tracemalloc`` does not expose.
 
+    The figure is read the way the JSON schema names it: each measured figure is a
+    direct key of the ``allocation`` object holding the per-arm map, so this is
+    ``allocation["tracemalloc_peak_bytes"][arm]``.
+
     Args:
         case: The case's JSON object.
         arm: ``"baseline"`` or ``"candidate"``.
@@ -425,14 +429,17 @@ def _peak_bytes(case: dict[str, Any], arm: str, *, name: str, report: str) -> fl
     allocation = case.get("allocation")
     if not isinstance(allocation, dict):
         pytest.fail(f"case {name!r} has no 'allocation' object\n{report}")
-    figures = allocation.get(arm)
-    if not isinstance(figures, dict):
+    peaks = allocation.get("tracemalloc_peak_bytes")
+    if not isinstance(peaks, dict):
         pytest.fail(
-            f"case {name!r} has no allocation figures for arm {arm!r}\n{report}"
+            f"case {name!r} has no 'tracemalloc_peak_bytes' map in its allocation "
+            f"object, found {type(peaks).__name__}. The JSON schema of "
+            "benchmarks/delayed_ab/main.py has moved and this test must be "
+            f"re-read against it.\n{report}"
         )
     return _number(
-        figures,
-        "tracemalloc_peak_bytes",
+        peaks,
+        arm,
         what=f"case {name!r}, arm {arm!r} peak allocation",
         report=report,
     )

@@ -72,7 +72,9 @@ Artefacts:
     suite from a clean working tree, which is what makes the commit they
     describe identifiable.
 
-Exit codes of the runner:
+Exit codes of the runner -- the outcomes of a run that started. A command line
+that cannot be parsed is rejected by ``argparse`` before the run starts, with
+its conventional status 2:
     0
         Every gate item held.
     1
@@ -80,7 +82,10 @@ Exit codes of the runner:
         checklist names the item that failed.
     2
         An equivalence mismatch. No artefact is written and no performance
-        verdict is produced.
+        verdict is produced. ``argparse`` uses the same status for a command
+        line it rejects before the run starts: that one prints a ``usage:``
+        message, while a mismatch prints ``equivalence mismatch`` and names
+        the differing case.
     3
         Artefacts were requested inside a dirty repository working tree. The
         runner refuses to write into ``results/`` and prints the offending
@@ -97,3 +102,5 @@ Halt and report:
     * A canonical graph carries a value that is not reproducible across
       processes, such as an ``id()``-derived layer name.
 """
+
+from __future__ import annotations

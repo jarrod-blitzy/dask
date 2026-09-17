@@ -79,10 +79,24 @@ from dask.threaded import get as _threaded_get
 from dask.tokenize import TokenizationError
 from dask.utils_test import inc
 
-# The single canonicaliser shared with the A/B harness (``benchmarks/delayed_ab/canon.py``).
-# It is imported dynamically because ``benchmarks/`` is a PEP 420 namespace package
-# (no ``__init__.py``): a static ``from benchmarks.delayed_ab.canon import ...`` makes
-# mypy see ``canon.py`` under two module names when the whole repository is checked.
+# The single canonicaliser shared with the A/B harness
+# (``benchmarks/delayed_ab/canon.py``). This module and ``benchmarks.delayed_ab.main``
+# bind the very same ``sys.modules["benchmarks.delayed_ab.canon"]`` entry, so the
+# characterisation evidence and the performance evidence cannot drift apart.
+#
+# The import is indirect for a type-checker reason rather than a preference.
+# ``benchmarks/`` is a PEP 420 namespace package (no ``__init__.py``), so mypy maps
+# ``canon.py`` from its path to ``delayed_ab.canon``; a static ``from
+# benchmarks.delayed_ab.canon import ...`` resolves that same file a second time as
+# ``benchmarks.delayed_ab.canon``, and mypy halts with ``Source file found twice under
+# different module names`` followed by ``errors prevented further checking`` whenever
+# ``canon.py`` is checked alongside this file -- which every ``pre-commit run
+# --all-files`` does -- silencing the type check of the entire repository. That error
+# is raised while the module graph is assembled and carries no error code, so no
+# inline suppression reaches it, and both remedies mypy names are out of scope here:
+# ``benchmarks/__init__.py`` falls outside the paths the run's structural criterion
+# permits, while ``explicit_package_bases`` would edit the frozen ``pyproject.toml``.
+# Applying either one makes the static spelling work unchanged.
 _canon = importlib.import_module("benchmarks.delayed_ab.canon")
 canonical_graph = _canon.canonical_graph
 canonical_result = _canon.canonical_result
@@ -122,6 +136,15 @@ def _pin_tokenization(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     Every mutation is reverted: ``monkeypatch`` restores the list and the
     ``dask.config.set`` context restores the configuration, so the module leaves
     no residue for the rest of the session.
+
+    Args:
+        monkeypatch: pytest's per-test patcher, used for the hasher pin because
+            it restores ``dask.hashing.hashers`` when the test ends whatever the
+            test does to it.
+
+    Yields:
+        None: with ``dask.hashing.hashers`` pinned to SHA-1 and ``_CONFIG_PINS``
+        applied, for the duration of one test.
     """
     monkeypatch.setattr(dask.hashing, "hashers", [dask.hashing._hash_sha1])
     with dask.config.set(_CONFIG_PINS):
@@ -200,6 +223,11 @@ class Inner:
     """Attribute target for the attribute-of-attribute corpus entry."""
 
     def __init__(self, w: int) -> None:
+        """Store the one attribute the attribute-of-attribute entry reads.
+
+        Args:
+            w: Value exposed as ``self.w``.
+        """
         self.w = w
 
 
@@ -207,6 +235,14 @@ class Obj:
     """Plain object wrapped by ``delayed`` for the attribute and method entries."""
 
     def __init__(self, v: int) -> None:
+        """Set the three attributes the attribute and method entries reach for.
+
+        Args:
+            v: Value exposed as ``self.v``, the target of ``o.v`` and the base of
+                ``meth``'s result. ``self.items`` gives the ``getitem`` entry a
+                subscriptable attribute and ``self.inner`` gives the
+                attribute-of-attribute entry a second hop.
+        """
         self.v = v
         self.items = [10, 11, 12]
         self.inner = Inner(9)
@@ -252,20 +288,58 @@ class HandRolledCollection:
     __dask_scheduler__ = staticmethod(_threaded_get)
     __dask_optimize__ = None
 
-    def __init__(self, dsk: dict[str, Any], keys: list[str]) -> None:
+    # ``dsk`` is annotated ``Any`` because a dask collection may hand back either
+    # graph shape, and both are used: a plain ``dict`` low-level graph and a
+    # ``HighLevelGraph`` (see ``_hlg_backed_collection``).
+    def __init__(self, dsk: Any, keys: list[str]) -> None:
+        """Store the graph and the output keys of the collection.
+
+        Args:
+            dsk: The collection's graph -- a plain ``dict`` low-level graph
+                mapping each key to its node, or a ``HighLevelGraph``.
+            keys: Output keys, in the order the finalizer receives them.
+        """
         self._dask = dsk
         self._keys = keys
 
     def __dask_tokenize__(self) -> list[str]:
+        """Return the output keys as the collection's token.
+
+        Returns:
+            list: the output keys. ``normalize_object`` returns the value of this
+            method as it stands, without recursive dispatch
+            (``dask/tokenize.py:194-198``), so the keys alone decide the
+            deterministic token of any expression that wraps this collection.
+        """
         return self._keys
 
-    def __dask_graph__(self) -> dict[str, Any]:
+    def __dask_graph__(self) -> Any:
+        """Return the graph.
+
+        Returns:
+            The graph as given to the constructor -- a plain ``dict``, which is
+            what a hand-rolled collection is allowed to expose, or a
+            ``HighLevelGraph`` for the ``_hlg_backed_collection`` variant.
+        """
         return self._dask
 
     def __dask_keys__(self) -> list[str]:
+        """Return the output keys.
+
+        Returns:
+            list: both keys, which is why finalizing this collection produces more
+            than one key and why it has to be reduced before it can be unpacked.
+        """
         return self._keys
 
     def __dask_postcompute__(self) -> tuple[Any, tuple[Any, ...]]:
+        """Return the finalizer that turns the computed keys into a value.
+
+        Returns:
+            tuple: ``(tuple, ())`` -- the computed keys are collected into a
+            tuple, with no extra arguments, exactly as ``test_delayed.py``'s
+            ``Tuple`` collection does.
+        """
         return tuple, ()
 
 
@@ -293,6 +367,13 @@ class SubDelayedLayers(Delayed):
     __slots__ = ()
 
     def __dask_layers__(self) -> Sequence[str]:
+        """Return the single layer name, exactly as the base class does.
+
+        Returns:
+            Sequence: ``(self._layer,)``. The value is deliberately identical to
+            ``Delayed.__dask_layers__``'s so that the graph content is unchanged
+            and the only difference is that the method is a subclass override.
+        """
         return (self._layer,)
 
 
@@ -307,6 +388,17 @@ class SubDelayedLayerDict(Delayed):
     __slots__ = ()
 
     def _layer_dict(self) -> dict[Any, Any]:
+        """Fail: the construction path must never dispatch to this name.
+
+        Returns:
+            dict: never -- the method always raises. The annotation records what a
+            leaf-layer helper of this name would have had to return.
+
+        Raises:
+            AssertionError: always. Reaching this body would mean the graph-merge
+                helper looked the name up on the object instead of calling the
+                module-level function, letting a public subclass intercept it.
+        """
         raise AssertionError(
             "a subclass method named _layer_dict must never be dispatched to"
         )
@@ -363,6 +455,65 @@ def _hand_rolled_collection() -> HandRolledCollection:
     )
 
 
+def _hlg_backed_collection() -> HandRolledCollection:
+    """Return a hand-rolled dask collection whose graph is a ``HighLevelGraph``.
+
+    The same protocol as :func:`_hand_rolled_collection` with the other graph
+    shape, so that a claim about what ``finalize`` does to a collection can be
+    made about both shapes rather than about one of them.
+    """
+    return HandRolledCollection(
+        HighLevelGraph({"hc": {"hc": DataNode("hc", 11)}}, {"hc": set()}), ["hc"]
+    )
+
+
+class _OpaqueKey:
+    """A valid graph key whose ``repr`` is the default, address-bearing one.
+
+    Hashable and equality-comparable, so dask accepts it as a key; unencodable,
+    because ``object.__repr__`` embeds the instance's memory address and
+    committed evidence may not carry one.
+    """
+
+    def __hash__(self) -> int:
+        return 11
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+
+class _IdentityYieldingTuple(tuple):
+    """A ``tuple`` subclass whose iteration yields its own identity.
+
+    Nothing stops a graph key from being a tuple subclass, and a canonicaliser
+    that accepts one on an ``isinstance`` test and rebuilds it as a plain tuple
+    would carry whatever this ``__iter__`` produces into the canonical output --
+    here a process-specific ``id()``. It is the reason the encodable-key check is
+    by exact type.
+    """
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter([f"id-{id(self)}"])
+
+
+class _RaisingReprKey:
+    """A valid graph key whose ``repr`` raises.
+
+    The canonicaliser's refusal message must be built from type metadata alone:
+    formatting the offending object would turn a clear diagnosis into this
+    unrelated ``RuntimeError``.
+    """
+
+    def __hash__(self) -> int:
+        return 13
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr executed")
+
+
 def _hlg_of(key: str) -> HighLevelGraph:
     """Return a single-layer ``HighLevelGraph`` holding one ``DataNode``."""
     return HighLevelGraph({key: {key: DataNode(key, 5)}}, {key: set()})
@@ -417,12 +568,25 @@ class _Expr(NamedTuple):
             token is a UUID, in which case the key is compared after
             ``normalize_key`` replaces the token with a structural placeholder.
         canonical: True when the canonical graph serialization is reproducible
-            and is therefore recorded in the golden and compared.
+            verbatim and is therefore recorded in the golden and compared as it
+            stands.
         computable: True when the entry takes part in the result assertions.
         picklable: True when the entry takes part in the pickle round trip.
+        volatile_tokens: True when the graph carries an inherently random 32-hex
+            identifier -- a ``uuid.uuid4().hex`` fallback from ``dask._expr``, not
+            a ``tokenize`` digest -- so the raw canonical dict differs between two
+            builds of the same expression. Such an entry pairs
+            ``canonical=False`` with this flag: its graph is still asserted in
+            full, through ``_stable_graph``, which replaces *only* the tokens a
+            double build proves random and leaves every deterministic token,
+            every key, every node kind, every dependency and both insertion
+            orders under assertion. No entry may opt out of graph comparison
+            altogether; ``test_every_entry_asserts_its_graph`` enforces that.
 
     Every ``False`` flag is justified by name in ``_EXCLUSION_REASONS``, which
-    ``test_flag_exclusions_are_documented`` keeps in step with this registry.
+    ``test_flag_exclusions_are_documented`` keeps in step with this registry, and
+    an entry whose computation raises is registered with its exact failure in
+    ``_COMPUTE_FAILURES``.
     """
 
     name: str
@@ -431,6 +595,7 @@ class _Expr(NamedTuple):
     canonical: bool = True
     computable: bool = True
     picklable: bool = True
+    volatile_tokens: bool = False
 
 
 def _build_duplicate_positional() -> Delayed:
@@ -483,6 +648,59 @@ def _build_nout_two_second() -> Delayed:
     """Unpack the second element of an ``nout=2`` call."""
     _x, y = delayed(pair, name="pair", pure=True, nout=2)()
     return y
+
+
+def _tuple_key_delayed() -> Delayed:
+    """Return a dependency whose key -- and layer name -- is a ``tuple``.
+
+    Tuple keys are what array, dataframe and bag collections use, and they are
+    the reason a key guard on the construction path has to recurse: every
+    element of the tuple has to be a builtin scalar before the guard may treat
+    the key as one a merge shortcut can hash and ``repr`` without a user-visible
+    side effect. This dependency is the accepting side of that recursion; the
+    rejecting side is exercised by
+    ``test_tuple_key_with_a_non_builtin_element_falls_back``, whose key cannot go
+    into the golden because it is not JSON-expressible.
+    """
+    key = ("tk", 0)
+    return Delayed(key, {key: DataNode(key, 5)})
+
+
+def _build_list_with_dependent_task() -> Delayed:
+    """``f([task, 1])``: a container holding a runnable node with a dependency.
+
+    Nothing in the list is a dask collection, so the container branch of
+    ``unpack_collections`` collects no collections at all -- and it still must
+    not hand the list back unchanged, because the ``Task`` inside it references
+    the key ``"dn"``. What decides is ``List(*args).dependencies``
+    (``dask/delayed.py:206-221``), and a construction path that reads it must
+    reach the same verdict for a node whose ``dependencies`` are non-empty as for
+    a bare ``TaskRef``.
+    """
+    return _ident()([Task("inner", ident, TaskRef("dn")), 1])
+
+
+def _build_several_dependencies_with_leaf() -> Delayed:
+    """``f(a, leaf)``: several dependencies, one of them a ``DelayedLeaf``.
+
+    A leaf contributes a single-node layer rather than a graph of its own, which
+    is a different arm of the several-dependency merge from the one an ordinary
+    ``Delayed`` dependency takes.
+    """
+    return _ident()(_leaf(), delayed(3, name="three-leaf"))
+
+
+def _build_several_dependencies_with_attr() -> Delayed:
+    """``f(o.v, a)``: several dependencies, one of them a ``DelayedAttr``.
+
+    Two things ride on this shape. The merge has to take the attribute's lazy
+    ``dask`` -- which itself merges its parent -- alongside an unrelated
+    dependency; and the resulting graph holds the legacy tuple task ``(getattr,
+    parent_key, attr)`` in a layer *other* than the one holding its parent, which
+    is the case a canonical serialization has to resolve against the whole graph
+    rather than one layer.
+    """
+    return _ident()(_obj().v, _leaf())
 
 
 def _build_delayed_call(pure: bool | None) -> Delayed:
@@ -543,6 +761,18 @@ CORPUS: tuple[_Expr, ...] = (
     ),
     _Expr("wrap_taskref", lambda: delayed(TaskRef("dn")), computable=False),
     _Expr("wrap_datanode", lambda: delayed(DataNode("dn", 5), name="dn")),
+    # Wrapping a *traversed* non-callable container that holds a ``Delayed``
+    # (``dask/delayed.py:618-647``): ``unpack_collections`` returns a task rather
+    # than the object, so the wrap takes its second branch -- the generated
+    # ``type(obj).__name__-<token>`` key, the rewrite of the container node's own
+    # key to that name, and a graph merged from the dependencies the traversal
+    # found. The dict form carries two dependencies, so it also pins the
+    # several-dependency insertion order of that branch.
+    _Expr("wrap_list_with_delayed", lambda: delayed([_leaf(), 1], pure=True)),
+    _Expr(
+        "wrap_dict_with_delayed",
+        lambda: delayed({"k": _leaf(), "j": _other_leaf()}, pure=True),
+    ),
     # list/tuple/set branch (``dask/delayed.py:206-221``).
     _Expr("arg_list_literal", lambda: _ident()([1, 2, 3])),
     _Expr("arg_list_with_delayed", lambda: _ident()([_leaf(), 1])),
@@ -602,20 +832,56 @@ CORPUS: tuple[_Expr, ...] = (
     _Expr("arg_delayed_value_leaf", lambda: _ident()(delayed(3, name="three-leaf"))),
     _Expr("arg_datanode_leaf", lambda: _ident()(delayed(DataNode("dn", 5), name="dn"))),
     _Expr("arg_dict_graph_delayed", lambda: _ident()(_dict_graph_delayed())),
+    # A dependency keyed by a ``tuple`` of builtins: the accepting side of a key
+    # guard's recursion, and the only corpus entry whose keys are not strings.
+    _Expr("arg_tuple_key_delayed", lambda: _ident()(_tuple_key_delayed())),
+    # Several dependencies, one per arm of the merge: an ordinary ``Delayed``
+    # beside a subclass that no exact-class guard may shortcut (so the *whole*
+    # call has to fall back), beside a plain-``dict``-backed dependency, beside a
+    # ``DelayedLeaf``, beside a ``DelayedAttr``.
+    _Expr("arg_several_deps_guard_mixed", lambda: _ident()(_leaf(), _sub_delayed())),
+    _Expr(
+        "arg_several_deps_dict_graph",
+        lambda: _ident()(_leaf(), _dict_graph_delayed()),
+    ),
+    _Expr("arg_several_deps_with_leaf", _build_several_dependencies_with_leaf),
+    _Expr("arg_several_deps_with_attr", _build_several_dependencies_with_attr),
+    # A container holding a task-spec node but no dask collection: the container
+    # may not be handed back unchanged, because the node references a key. Both
+    # entries reference the key ``"dn"``, which no layer of their graph holds, so
+    # computing them raises -- the failure is asserted by name in
+    # ``_COMPUTE_FAILURES`` rather than passed over.
+    _Expr(
+        "arg_list_with_taskref", lambda: _ident()([TaskRef("dn"), 1]), computable=False
+    ),
+    _Expr(
+        "arg_list_with_dependent_task",
+        _build_list_with_dependent_task,
+        computable=False,
+    ),
     # Non-``Delayed`` dask collection (``dask/delayed.py:177-195``). Its graph
-    # acquires a ``finalize-hlgfinalizecompute-<hex>-<hex>`` layer whose hex is a
-    # ``uuid4().hex`` fallback, so no canonical form is reproducible; the output
-    # key and the computed result are (see ``_EXCLUSION_REASONS``).
+    # acquires a ``finalize-hlgfinalizecompute-<hex>-<hex>`` layer whose two
+    # hexes are ``uuid4().hex`` fallbacks from ``dask._expr``, and the same hex
+    # suffixes the node keys inside that layer, so the *raw* canonical dict
+    # differs between two builds of the same expression. Everything else about
+    # the graph is fixed, and that is what ``volatile_tokens`` asserts: the
+    # golden holds the canonical form with only the observedly-random tokens
+    # replaced by ``<hexN>``, so every key, node kind, dependency and insertion
+    # order stays compared. ``finalize()`` stores an ``HLGFinalizeCompute``
+    # expression rather than a graph container, which is the same situation one
+    # volatile token further on.
     _Expr(
         "arg_hand_rolled_collection",
         lambda: _ident()(_hand_rolled_collection()),
         canonical=False,
+        volatile_tokens=True,
     ),
     _Expr(
         "finalize_collection",
         _build_finalize_collection,
         canonical=False,
         computable=False,
+        volatile_tokens=True,
     ),
     # ``pure`` semantics (``dask/delayed.py:392-410``).
     _Expr("call_pure_true", lambda: delayed(inc, name="inc", pure=True)(1)),
@@ -699,7 +965,7 @@ _EXCLUSION_REASONS: dict[str, str] = {
     ),
     "wrap_taskref": (
         "computable=False: a TaskRef is a pointer to a key, not a runnable node, so "
-        "computing it raises KeyError('dn')"
+        "computing it raises KeyError('dn') -- asserted verbatim in _COMPUTE_FAILURES"
     ),
     "arg_delayed_leaf": (
         "computable=False: the dependency is a DelayedLeaf wrapping a function, so the "
@@ -707,22 +973,61 @@ _EXCLUSION_REASONS: dict[str, str] = {
         "arg_delayed_value_leaf covers the same DataNode arm with a stable result"
     ),
     "arg_hand_rolled_collection": (
-        "canonical=False: routing a non-Delayed collection through unpack_collections adds a "
-        "finalize-hlgfinalizecompute-<hex>-<hex> layer whose hex comes from uuid4().hex "
-        "(dask/_expr.py), so the layer name -- and with it the canonical graph -- is not "
-        "reproducible; the deterministic output key and the computed result are asserted "
-        "instead, as benchmarks/delayed_ab/canon.py prescribes"
+        "canonical=False with volatile_tokens=True: routing a non-Delayed collection through "
+        "unpack_collections adds a finalize-hlgfinalizecompute-<hex>-<hex> layer whose hexes come "
+        "from uuid4().hex (dask/_expr.py) and suffix the node keys inside it, so the raw "
+        "canonical dict is not reproducible -- but the graph is still asserted in full, through "
+        "the double-build normalisation of _stable_graph, alongside the deterministic output key "
+        "and the computed result"
     ),
     "finalize_collection": (
-        "canonical=False and computable=False: finalize() returns a Delayed whose graph is an "
-        "HLGFinalizeCompute expression rather than a HighLevelGraph or a dict, so "
-        "canonical_graph raises TypeError('HLGFinalizeCompute' object is not iterable) and "
-        "computing raises AttributeError('HLGFinalizeCompute' object has no attribute 'copy'); "
-        "the entry exists to lock the 'finalize-<token>' key form"
+        "canonical=False with volatile_tokens=True, and computable=False: finalize() returns a "
+        "Delayed whose graph is an HLGFinalizeCompute expression, which carries one uuid4().hex "
+        "token, so the raw canonical dict is not reproducible and the graph is asserted through "
+        "_stable_graph instead; computing it raises AttributeError('HLGFinalizeCompute' object "
+        "has no attribute 'copy') at this commit, which is asserted verbatim in "
+        "_COMPUTE_FAILURES rather than passed over"
+    ),
+    "arg_list_with_taskref": (
+        "computable=False: the list holds a bare TaskRef to the key 'dn', which no layer of the "
+        "graph provides, so computing raises ValueError('Missing dependency dn for dependents "
+        "...') -- asserted verbatim in _COMPUTE_FAILURES"
+    ),
+    "arg_list_with_dependent_task": (
+        "computable=False: the list holds a Task referencing the key 'dn', which no layer of the "
+        "graph provides, so computing raises ValueError('Missing dependency dn for dependents "
+        "...') -- asserted verbatim in _COMPUTE_FAILURES"
     ),
     "guard_mapping_proxy_graph": (
         "picklable=False: the dependency's graph is a types.MappingProxyType, which pickle "
         "refuses (TypeError: cannot pickle 'mappingproxy' object)"
+    ),
+}
+
+#: The corpus entries that cannot be computed, with the exception each one
+#: raises on the pre-refactor module -- exact type and exact message, measured,
+#: never a fragment. An entry lands here rather than simply carrying
+#: ``computable=False``: a path whose result *is* an exception has that exception
+#: asserted by ``test_non_runnable_entries_fail_exactly_as_they_did``, so a
+#: change in how it fails is caught as readily as a change in a value. Two of the
+#: messages embed the expression's own key, which is deterministic, so they are
+#: recorded in full as well.
+_COMPUTE_FAILURES: dict[str, tuple[type[BaseException], str]] = {
+    "wrap_taskref": (KeyError, "'dn'"),
+    "finalize_collection": (
+        AttributeError,
+        "'HLGFinalizeCompute' object has no attribute 'copy'\n\nThis often means "
+        "that you are attempting to use an unsupported API function..",
+    ),
+    "arg_list_with_taskref": (
+        ValueError,
+        "Missing dependency dn for dependents "
+        "{'ident-c79c565af7915db3336df040927eba3b'}",
+    ),
+    "arg_list_with_dependent_task": (
+        ValueError,
+        "Missing dependency dn for dependents "
+        "{'ident-853f00e7b63921c6aa234b62a83f3f37'}",
     ),
 }
 
@@ -747,6 +1052,7 @@ _GUARD_ENTRIES: tuple[str, ...] = (
     "guard_subclass_dask_layers",
     "guard_subclass_layer_dict",
     "guard_mapping_proxy_graph",
+    "arg_several_deps_guard_mixed",
 )
 
 #: Every branch of ``unpack_collections`` (``dask/delayed.py:115-293``) mapped to
@@ -759,6 +1065,7 @@ _BRANCH_COVERAGE: dict[str, str] = {
     "tuple iterator coercion (:199-200)": "arg_tuple_iterator",
     "set iterator coercion (:201-202)": "arg_set_iterator",
     "list/tuple/set literal short-circuit (:214-215)": "arg_list_literal",
+    "list holding a dependent node, no collection (:206-221)": "arg_list_with_taskref",
     "list holding a collection (:206-217)": "arg_list_with_delayed",
     "tuple output-type restoration (:219-220)": "arg_tuple_with_delayed",
     "set holding a collection (:206-221)": "arg_set_with_delayed",
@@ -823,6 +1130,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-479de180fadf35bef9b14377a02a2e3f",
         "result_repr": "(True,)",
+        "stable_graph": None,
     },
     "arg_bytes": {
         "graph": {
@@ -842,6 +1150,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-069e5d002edfbdd6b4fe85609c61f762",
         "result_repr": "(b'xy',)",
+        "stable_graph": None,
     },
     "arg_complex": {
         "graph": {
@@ -861,6 +1170,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-58b2c8b88ad440989db630826bb487b3",
         "result_repr": "((1+2j),)",
+        "stable_graph": None,
     },
     "arg_dataclass_literal": {
         "graph": {
@@ -880,6 +1190,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-2b8023b48c36384470ab10ebcc9619c3",
         "result_repr": "(Box(a=1, b='s'),)",
+        "stable_graph": None,
     },
     "arg_dataclass_with_delayed": {
         "graph": {
@@ -923,6 +1234,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-0e803bf67da18347a13dd41031ff7a89",
         "result_repr": "(Box(a=2, b='s'),)",
+        "stable_graph": None,
     },
     "arg_datanode_leaf": {
         "graph": {
@@ -953,6 +1265,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-35c1fa32c0139a469f5604663da3d9f4",
         "result_repr": "(5,)",
+        "stable_graph": None,
     },
     "arg_delayed_leaf": {
         "graph": {
@@ -983,6 +1296,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-3fa65e5e2361d20664e44e110b0ee8d8",
         "result_repr": None,
+        "stable_graph": None,
     },
     "arg_delayed_value_leaf": {
         "graph": {
@@ -1020,6 +1334,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-1598b4f5c1e157d4855e0da78b9743db",
         "result_repr": "(3,)",
+        "stable_graph": None,
     },
     "arg_dict_delayed_key": {
         "graph": {
@@ -1063,6 +1378,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-3d928f19640b869525079dea6b686d4a",
         "result_repr": "({2: 1},)",
+        "stable_graph": None,
     },
     "arg_dict_delayed_value": {
         "graph": {
@@ -1106,6 +1422,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-b8ff11051f6d686cfb732463bbdc2e72",
         "result_repr": "({'k': 2},)",
+        "stable_graph": None,
     },
     "arg_dict_graph_delayed": {
         "graph": {
@@ -1136,6 +1453,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-df5af5572037466a0e5bd86b9c97fa91",
         "result_repr": "(5,)",
+        "stable_graph": None,
     },
     "arg_dict_literal": {
         "graph": {
@@ -1155,6 +1473,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-005d9b8feee2d6504f377842be0df79d",
         "result_repr": "({'k': 1},)",
+        "stable_graph": None,
     },
     "arg_duplicate_in_list": {
         "graph": {
@@ -1198,6 +1517,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-5b9bf7a118115b19e651c954888eca1a",
         "result_repr": "([2, 2, 2],)",
+        "stable_graph": None,
     },
     "arg_duplicate_positional": {
         "graph": {
@@ -1241,6 +1561,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-2eb904727fd2af04e11a38ddaab9240e",
         "result_repr": "(2, 2)",
+        "stable_graph": None,
     },
     "arg_empty_dict": {
         "graph": {
@@ -1260,6 +1581,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-281fb13c7ae98bf73409f2defeecdf51",
         "result_repr": "({},)",
+        "stable_graph": None,
     },
     "arg_empty_list": {
         "graph": {
@@ -1279,6 +1601,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-a0c2f3cfbfca5c11a6d69c20cce9c3b8",
         "result_repr": "([],)",
+        "stable_graph": None,
     },
     "arg_empty_set": {
         "graph": {
@@ -1298,6 +1621,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-7df79d31aa263e6ef7f411886fa8e6c5",
         "result_repr": "(set(),)",
+        "stable_graph": None,
     },
     "arg_empty_tuple": {
         "graph": {
@@ -1317,6 +1641,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-51d562c44b277dfd3c129022d175dab7",
         "result_repr": "((),)",
+        "stable_graph": None,
     },
     "arg_float": {
         "graph": {
@@ -1336,11 +1661,68 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-e998c7aa085bf9349fa29aa9ece6f5f5",
         "result_repr": "(1.5,)",
+        "stable_graph": None,
     },
     "arg_hand_rolled_collection": {
         "graph": None,
         "key": "ident-99645681c6f883e003c9b0070e583172",
         "result_repr": "((1, 2),)",
+        "stable_graph": {
+            "dask_keys": ["ident-99645681c6f883e003c9b0070e583172"],
+            "dask_layers": ["ident-99645681c6f883e003c9b0070e583172"],
+            "dependencies": [
+                ["finalize-hlgfinalizecompute-<hex0>-<hex1>", []],
+                [
+                    "ident-99645681c6f883e003c9b0070e583172",
+                    ["finalize-hlgfinalizecompute-<hex0>-<hex1>"],
+                ],
+            ],
+            "dependency_order": [
+                "ident-99645681c6f883e003c9b0070e583172",
+                "finalize-hlgfinalizecompute-<hex0>-<hex1>",
+            ],
+            "key": "ident-99645681c6f883e003c9b0070e583172",
+            "layer_order": [
+                "ident-99645681c6f883e003c9b0070e583172",
+                "finalize-hlgfinalizecompute-<hex0>-<hex1>",
+            ],
+            "layers": [
+                [
+                    "finalize-hlgfinalizecompute-<hex0>-<hex1>",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "finalize-hlgfinalizecompute-<hex0>",
+                            "Task",
+                            ["ta", "tb"],
+                            "tuple",
+                        ],
+                        [
+                            "finalize-hlgfinalizecompute-<hex0>-<hex1>",
+                            "Task",
+                            ["ta-<hex1>", "tb-<hex1>"],
+                            "_identity",
+                        ],
+                        ["ta", "DataNode", [], None],
+                        ["ta-<hex1>", "Task", [], "_identity"],
+                        ["tb", "DataNode", [], None],
+                        ["tb-<hex1>", "Task", [], "_identity"],
+                    ],
+                ],
+                [
+                    "ident-99645681c6f883e003c9b0070e583172",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "ident-99645681c6f883e003c9b0070e583172",
+                            "Task",
+                            ["finalize-hlgfinalizecompute-<hex0>-<hex1>"],
+                            "ident",
+                        ]
+                    ],
+                ],
+            ],
+        },
     },
     "arg_int": {
         "graph": {
@@ -1360,6 +1742,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-2c2468fc170d8d44e486152b85005245",
         "result_repr": "(1,)",
+        "stable_graph": None,
     },
     "arg_list_iterator": {
         "graph": {
@@ -1379,6 +1762,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-36db7f0563b8b9aeaf638d565fa1f8c4",
         "result_repr": "([1, 2],)",
+        "stable_graph": None,
     },
     "arg_list_iterator_with_delayed": {
         "graph": {
@@ -1422,6 +1806,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-3ce94eb4d5d85e5fd1bf2110e4be5f84",
         "result_repr": "([2, 1],)",
+        "stable_graph": None,
     },
     "arg_list_literal": {
         "graph": {
@@ -1441,6 +1826,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-95d449e68342442599e9a90ce127d03a",
         "result_repr": "([1, 2, 3],)",
+        "stable_graph": None,
     },
     "arg_list_with_delayed": {
         "graph": {
@@ -1484,6 +1870,61 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-004d69c5aef967ffa674ba8fcbd84315",
         "result_repr": "([2, 1],)",
+        "stable_graph": None,
+    },
+    "arg_list_with_dependent_task": {
+        "graph": {
+            "dask_keys": ["ident-853f00e7b63921c6aa234b62a83f3f37"],
+            "dask_layers": ["ident-853f00e7b63921c6aa234b62a83f3f37"],
+            "dependencies": [["ident-853f00e7b63921c6aa234b62a83f3f37", []]],
+            "dependency_order": ["ident-853f00e7b63921c6aa234b62a83f3f37"],
+            "key": "ident-853f00e7b63921c6aa234b62a83f3f37",
+            "layer_order": ["ident-853f00e7b63921c6aa234b62a83f3f37"],
+            "layers": [
+                [
+                    "ident-853f00e7b63921c6aa234b62a83f3f37",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "ident-853f00e7b63921c6aa234b62a83f3f37",
+                            "Task",
+                            ["dn"],
+                            "ident",
+                        ]
+                    ],
+                ]
+            ],
+        },
+        "key": "ident-853f00e7b63921c6aa234b62a83f3f37",
+        "result_repr": None,
+        "stable_graph": None,
+    },
+    "arg_list_with_taskref": {
+        "graph": {
+            "dask_keys": ["ident-c79c565af7915db3336df040927eba3b"],
+            "dask_layers": ["ident-c79c565af7915db3336df040927eba3b"],
+            "dependencies": [["ident-c79c565af7915db3336df040927eba3b", []]],
+            "dependency_order": ["ident-c79c565af7915db3336df040927eba3b"],
+            "key": "ident-c79c565af7915db3336df040927eba3b",
+            "layer_order": ["ident-c79c565af7915db3336df040927eba3b"],
+            "layers": [
+                [
+                    "ident-c79c565af7915db3336df040927eba3b",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "ident-c79c565af7915db3336df040927eba3b",
+                            "Task",
+                            ["dn"],
+                            "ident",
+                        ]
+                    ],
+                ]
+            ],
+        },
+        "key": "ident-c79c565af7915db3336df040927eba3b",
+        "result_repr": None,
+        "stable_graph": None,
     },
     "arg_namedtuple_literal": {
         "graph": {
@@ -1503,6 +1944,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-9579ba3513aeed77b487aebb7575b121",
         "result_repr": "(Point(x=1, y=2),)",
+        "stable_graph": None,
     },
     "arg_namedtuple_with_delayed": {
         "graph": {
@@ -1546,6 +1988,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-c3bc65bd4e077495ae8692e0745b4a9f",
         "result_repr": "(Point(x=2, y=2),)",
+        "stable_graph": None,
     },
     "arg_nested_list_depth3": {
         "graph": {
@@ -1589,6 +2032,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-4276245fe4734cde693c9f567e8db238",
         "result_repr": "([[[2]]],)",
+        "stable_graph": None,
     },
     "arg_nested_mixed": {
         "graph": {
@@ -1632,6 +2076,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-ad9104ee68e07579217ef0009c5d34a3",
         "result_repr": "([{'k': (2, 1)}, [2, 2]],)",
+        "stable_graph": None,
     },
     "arg_none": {
         "graph": {
@@ -1651,6 +2096,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-20e29962a34319a9f919fd1e3ef6801e",
         "result_repr": "(None,)",
+        "stable_graph": None,
     },
     "arg_set_iterator": {
         "graph": {
@@ -1670,6 +2116,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-e13182a23ef98e7baee4c6fba8a7a8da",
         "result_repr": "({1},)",
+        "stable_graph": None,
     },
     "arg_set_literal": {
         "graph": {
@@ -1689,6 +2136,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-accd85cbd80c042b687d0e8775f10505",
         "result_repr": "({1, 2, 3},)",
+        "stable_graph": None,
     },
     "arg_set_with_delayed": {
         "graph": {
@@ -1732,6 +2180,224 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-2945caca037fdbaa9ac1525a08c99e5c",
         "result_repr": "({2},)",
+        "stable_graph": None,
+    },
+    "arg_several_deps_dict_graph": {
+        "graph": {
+            "dask_keys": ["ident-b807708bf3da31110e69cce30a60ca6f"],
+            "dask_layers": ["ident-b807708bf3da31110e69cce30a60ca6f"],
+            "dependencies": [
+                ["dgkey", []],
+                [
+                    "ident-b807708bf3da31110e69cce30a60ca6f",
+                    ["dgkey", "inc-5852f565112f1604bc52264ea5e287dc"],
+                ],
+                ["inc-5852f565112f1604bc52264ea5e287dc", []],
+            ],
+            "dependency_order": [
+                "ident-b807708bf3da31110e69cce30a60ca6f",
+                "inc-5852f565112f1604bc52264ea5e287dc",
+                "dgkey",
+            ],
+            "key": "ident-b807708bf3da31110e69cce30a60ca6f",
+            "layer_order": [
+                "ident-b807708bf3da31110e69cce30a60ca6f",
+                "inc-5852f565112f1604bc52264ea5e287dc",
+                "dgkey",
+            ],
+            "layers": [
+                ["dgkey", "MaterializedLayer", [["dgkey", "DataNode", [], None]]],
+                [
+                    "ident-b807708bf3da31110e69cce30a60ca6f",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "ident-b807708bf3da31110e69cce30a60ca6f",
+                            "Task",
+                            ["dgkey", "inc-5852f565112f1604bc52264ea5e287dc"],
+                            "ident",
+                        ]
+                    ],
+                ],
+                [
+                    "inc-5852f565112f1604bc52264ea5e287dc",
+                    "MaterializedLayer",
+                    [["inc-5852f565112f1604bc52264ea5e287dc", "Task", [], "inc"]],
+                ],
+            ],
+        },
+        "key": "ident-b807708bf3da31110e69cce30a60ca6f",
+        "result_repr": "(2, 5)",
+        "stable_graph": None,
+    },
+    "arg_several_deps_guard_mixed": {
+        "graph": {
+            "dask_keys": ["ident-4d2fd37f644ecc9c79595b39881dc1ab"],
+            "dask_layers": ["ident-4d2fd37f644ecc9c79595b39881dc1ab"],
+            "dependencies": [
+                [
+                    "ident-4d2fd37f644ecc9c79595b39881dc1ab",
+                    ["inc-5852f565112f1604bc52264ea5e287dc", "subkey"],
+                ],
+                ["inc-5852f565112f1604bc52264ea5e287dc", []],
+                ["subkey", []],
+            ],
+            "dependency_order": [
+                "ident-4d2fd37f644ecc9c79595b39881dc1ab",
+                "inc-5852f565112f1604bc52264ea5e287dc",
+                "subkey",
+            ],
+            "key": "ident-4d2fd37f644ecc9c79595b39881dc1ab",
+            "layer_order": [
+                "ident-4d2fd37f644ecc9c79595b39881dc1ab",
+                "inc-5852f565112f1604bc52264ea5e287dc",
+                "subkey",
+            ],
+            "layers": [
+                [
+                    "ident-4d2fd37f644ecc9c79595b39881dc1ab",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "ident-4d2fd37f644ecc9c79595b39881dc1ab",
+                            "Task",
+                            ["inc-5852f565112f1604bc52264ea5e287dc", "subkey"],
+                            "ident",
+                        ]
+                    ],
+                ],
+                [
+                    "inc-5852f565112f1604bc52264ea5e287dc",
+                    "MaterializedLayer",
+                    [["inc-5852f565112f1604bc52264ea5e287dc", "Task", [], "inc"]],
+                ],
+                ["subkey", "MaterializedLayer", [["subkey", "DataNode", [], None]]],
+            ],
+        },
+        "key": "ident-4d2fd37f644ecc9c79595b39881dc1ab",
+        "result_repr": "(2, 5)",
+        "stable_graph": None,
+    },
+    "arg_several_deps_with_attr": {
+        "graph": {
+            "dask_keys": ["ident-a0ea2b61f30d75a4f638e5a22bb2b73a"],
+            "dask_layers": ["ident-a0ea2b61f30d75a4f638e5a22bb2b73a"],
+            "dependencies": [
+                ["getattr-b73ec8674b3d2dc92415a8be924f4cbf", ["obj"]],
+                [
+                    "ident-a0ea2b61f30d75a4f638e5a22bb2b73a",
+                    [
+                        "getattr-b73ec8674b3d2dc92415a8be924f4cbf",
+                        "inc-5852f565112f1604bc52264ea5e287dc",
+                    ],
+                ],
+                ["inc-5852f565112f1604bc52264ea5e287dc", []],
+                ["obj", []],
+            ],
+            "dependency_order": [
+                "ident-a0ea2b61f30d75a4f638e5a22bb2b73a",
+                "obj",
+                "getattr-b73ec8674b3d2dc92415a8be924f4cbf",
+                "inc-5852f565112f1604bc52264ea5e287dc",
+            ],
+            "key": "ident-a0ea2b61f30d75a4f638e5a22bb2b73a",
+            "layer_order": [
+                "ident-a0ea2b61f30d75a4f638e5a22bb2b73a",
+                "obj",
+                "getattr-b73ec8674b3d2dc92415a8be924f4cbf",
+                "inc-5852f565112f1604bc52264ea5e287dc",
+            ],
+            "layers": [
+                [
+                    "getattr-b73ec8674b3d2dc92415a8be924f4cbf",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "getattr-b73ec8674b3d2dc92415a8be924f4cbf",
+                            "legacy-tuple",
+                            ["obj"],
+                            None,
+                        ]
+                    ],
+                ],
+                [
+                    "ident-a0ea2b61f30d75a4f638e5a22bb2b73a",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "ident-a0ea2b61f30d75a4f638e5a22bb2b73a",
+                            "Task",
+                            [
+                                "getattr-b73ec8674b3d2dc92415a8be924f4cbf",
+                                "inc-5852f565112f1604bc52264ea5e287dc",
+                            ],
+                            "ident",
+                        ]
+                    ],
+                ],
+                [
+                    "inc-5852f565112f1604bc52264ea5e287dc",
+                    "MaterializedLayer",
+                    [["inc-5852f565112f1604bc52264ea5e287dc", "Task", [], "inc"]],
+                ],
+                ["obj", "MaterializedLayer", [["obj", "DataNode", [], None]]],
+            ],
+        },
+        "key": "ident-a0ea2b61f30d75a4f638e5a22bb2b73a",
+        "result_repr": "(3, 2)",
+        "stable_graph": None,
+    },
+    "arg_several_deps_with_leaf": {
+        "graph": {
+            "dask_keys": ["ident-c27f669c23db4071a9606a6d48bbce23"],
+            "dask_layers": ["ident-c27f669c23db4071a9606a6d48bbce23"],
+            "dependencies": [
+                [
+                    "ident-c27f669c23db4071a9606a6d48bbce23",
+                    ["inc-5852f565112f1604bc52264ea5e287dc", "three-leaf"],
+                ],
+                ["inc-5852f565112f1604bc52264ea5e287dc", []],
+                ["three-leaf", []],
+            ],
+            "dependency_order": [
+                "ident-c27f669c23db4071a9606a6d48bbce23",
+                "inc-5852f565112f1604bc52264ea5e287dc",
+                "three-leaf",
+            ],
+            "key": "ident-c27f669c23db4071a9606a6d48bbce23",
+            "layer_order": [
+                "ident-c27f669c23db4071a9606a6d48bbce23",
+                "inc-5852f565112f1604bc52264ea5e287dc",
+                "three-leaf",
+            ],
+            "layers": [
+                [
+                    "ident-c27f669c23db4071a9606a6d48bbce23",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "ident-c27f669c23db4071a9606a6d48bbce23",
+                            "Task",
+                            ["inc-5852f565112f1604bc52264ea5e287dc", "three-leaf"],
+                            "ident",
+                        ]
+                    ],
+                ],
+                [
+                    "inc-5852f565112f1604bc52264ea5e287dc",
+                    "MaterializedLayer",
+                    [["inc-5852f565112f1604bc52264ea5e287dc", "Task", [], "inc"]],
+                ],
+                [
+                    "three-leaf",
+                    "MaterializedLayer",
+                    [["three-leaf", "DataNode", [], None]],
+                ],
+            ],
+        },
+        "key": "ident-c27f669c23db4071a9606a6d48bbce23",
+        "result_repr": "(2, 3)",
+        "stable_graph": None,
     },
     "arg_slice_literal": {
         "graph": {
@@ -1751,6 +2417,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-7ab4c03942d58d373b077b8da246904c",
         "result_repr": "(slice(1, 5, 2),)",
+        "stable_graph": None,
     },
     "arg_slice_with_delayed": {
         "graph": {
@@ -1794,6 +2461,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-644c86d459c4c086931a88aefe7b5119",
         "result_repr": "(slice(2, 5, None),)",
+        "stable_graph": None,
     },
     "arg_str": {
         "graph": {
@@ -1813,6 +2481,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-716f1034d088581f82f5d7ee76f565b9",
         "result_repr": "('s',)",
+        "stable_graph": None,
     },
     "arg_tuple_iterator": {
         "graph": {
@@ -1832,6 +2501,42 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-752bf50d0900c4e6fecd809fe1e6caa2",
         "result_repr": "((1, 2),)",
+        "stable_graph": None,
+    },
+    "arg_tuple_key_delayed": {
+        "graph": {
+            "dask_keys": ["ident-9eeed6a7f12006002ea644954aaebf76"],
+            "dask_layers": ["ident-9eeed6a7f12006002ea644954aaebf76"],
+            "dependencies": [
+                ["('tk', 0)", []],
+                ["ident-9eeed6a7f12006002ea644954aaebf76", ["('tk', 0)"]],
+            ],
+            "dependency_order": ["ident-9eeed6a7f12006002ea644954aaebf76", "('tk', 0)"],
+            "key": "ident-9eeed6a7f12006002ea644954aaebf76",
+            "layer_order": ["ident-9eeed6a7f12006002ea644954aaebf76", "('tk', 0)"],
+            "layers": [
+                [
+                    "('tk', 0)",
+                    "MaterializedLayer",
+                    [["('tk', 0)", "DataNode", [], None]],
+                ],
+                [
+                    "ident-9eeed6a7f12006002ea644954aaebf76",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "ident-9eeed6a7f12006002ea644954aaebf76",
+                            "Task",
+                            ["('tk', 0)"],
+                            "ident",
+                        ]
+                    ],
+                ],
+            ],
+        },
+        "key": "ident-9eeed6a7f12006002ea644954aaebf76",
+        "result_repr": "(5,)",
+        "stable_graph": None,
     },
     "arg_tuple_literal": {
         "graph": {
@@ -1851,6 +2556,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-29a987695b203e31c66ac7a157a66e8a",
         "result_repr": "((1, 2),)",
+        "stable_graph": None,
     },
     "arg_tuple_with_delayed": {
         "graph": {
@@ -1894,6 +2600,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-abe2c00feb8e1d3007b82d33fbcad638",
         "result_repr": "((2, 1),)",
+        "stable_graph": None,
     },
     "arg_two_dependencies": {
         "graph": {
@@ -1951,6 +2658,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-44dbd716a98aad621364346979df06de",
         "result_repr": "(2, 3)",
+        "stable_graph": None,
     },
     "attr_items_getitem": {
         "graph": {
@@ -1983,7 +2691,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
                         [
                             "getattr-f8efbec48aa4260ded710376183b7ba5",
                             "legacy-tuple",
-                            [],
+                            ["obj"],
                             None,
                         ]
                     ],
@@ -2005,6 +2713,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "getitem-e9440fd77ae78b0d4a6a58d9dcfbcfa3",
         "result_repr": "11",
+        "stable_graph": None,
     },
     "attr_of_attr": {
         "graph": {
@@ -2037,7 +2746,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
                         [
                             "getattr-4d6d83f7536e13768743295ab3bd2775",
                             "legacy-tuple",
-                            [],
+                            ["obj"],
                             None,
                         ]
                     ],
@@ -2049,7 +2758,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
                         [
                             "getattr-e6dab9e42a108e1d46bf06102a2d0a0b",
                             "legacy-tuple",
-                            [],
+                            ["getattr-4d6d83f7536e13768743295ab3bd2775"],
                             None,
                         ]
                     ],
@@ -2059,6 +2768,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "getattr-e6dab9e42a108e1d46bf06102a2d0a0b",
         "result_repr": "9",
+        "stable_graph": None,
     },
     "attr_v": {
         "graph": {
@@ -2079,7 +2789,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
                         [
                             "getattr-b73ec8674b3d2dc92415a8be924f4cbf",
                             "legacy-tuple",
-                            [],
+                            ["obj"],
                             None,
                         ]
                     ],
@@ -2089,6 +2799,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "getattr-b73ec8674b3d2dc92415a8be924f4cbf",
         "result_repr": "3",
+        "stable_graph": None,
     },
     "call_dask_key_name": {
         "graph": {
@@ -2108,6 +2819,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "explicit-call-key",
         "result_repr": "2",
+        "stable_graph": None,
     },
     "call_default_name": {
         "graph": {
@@ -2127,6 +2839,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "inc-d16c77ed2f4f68bb5383a923c62fc22c",
         "result_repr": "2",
+        "stable_graph": None,
     },
     "call_global_delayed_pure": {
         "graph": {
@@ -2146,6 +2859,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "inc-5852f565112f1604bc52264ea5e287dc",
         "result_repr": "2",
+        "stable_graph": None,
     },
     "call_pure_false": {
         "graph": {
@@ -2161,6 +2875,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "inc-#0",
         "result_repr": "2",
+        "stable_graph": None,
     },
     "call_pure_true": {
         "graph": {
@@ -2180,6 +2895,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "inc-5852f565112f1604bc52264ea5e287dc",
         "result_repr": "2",
+        "stable_graph": None,
     },
     "delayed_call_impure": {
         "graph": {
@@ -2214,6 +2930,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "apply-#0",
         "result_repr": "2",
+        "stable_graph": None,
     },
     "delayed_call_pure": {
         "graph": {
@@ -2257,11 +2974,36 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "apply-48099599c4a4d25761240ca3decec089",
         "result_repr": "2",
+        "stable_graph": None,
     },
     "finalize_collection": {
         "graph": None,
         "key": "finalize-6bd795b2e9accac4e918747e25da4d38",
         "result_repr": None,
+        "stable_graph": {
+            "dask_keys": ["finalize-6bd795b2e9accac4e918747e25da4d38"],
+            "dask_layers": ["finalize-6bd795b2e9accac4e918747e25da4d38"],
+            "dependencies": [["finalize-6bd795b2e9accac4e918747e25da4d38", []]],
+            "dependency_order": ["finalize-6bd795b2e9accac4e918747e25da4d38"],
+            "key": "finalize-6bd795b2e9accac4e918747e25da4d38",
+            "layer_order": ["finalize-6bd795b2e9accac4e918747e25da4d38"],
+            "layers": [
+                [
+                    "finalize-6bd795b2e9accac4e918747e25da4d38",
+                    "dict",
+                    [
+                        [
+                            "finalize-hlgfinalizecompute-<hex0>",
+                            "Task",
+                            ["ta", "tb"],
+                            "tuple",
+                        ],
+                        ["ta", "DataNode", [], None],
+                        ["tb", "DataNode", [], None],
+                    ],
+                ]
+            ],
+        },
     },
     "guard_mapping_proxy_graph": {
         "graph": {
@@ -2292,6 +3034,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-1a05d5989fcd575082000c787d633dbd",
         "result_repr": "(5,)",
+        "stable_graph": None,
     },
     "guard_subclass": {
         "graph": {
@@ -2322,6 +3065,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-11133fbff927db683bec9e0dde4c091d",
         "result_repr": "(5,)",
+        "stable_graph": None,
     },
     "guard_subclass_dask_layers": {
         "graph": {
@@ -2359,6 +3103,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-abd6a058945122515edd893ddfd4c571",
         "result_repr": "(5,)",
+        "stable_graph": None,
     },
     "guard_subclass_layer_dict": {
         "graph": {
@@ -2399,6 +3144,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "ident-b321f73872bbd12dc3802c7848bacc16",
         "result_repr": "(5,)",
+        "stable_graph": None,
     },
     "kwargs_literal": {
         "graph": {
@@ -2425,6 +3171,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "collect-bfcc9f334e410650ccc73099e6f11615",
         "result_repr": "((), {'x': 1})",
+        "stable_graph": None,
     },
     "kwargs_with_delayed": {
         "graph": {
@@ -2468,6 +3215,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "collect-a6ffaaa7e60d4c364fd17a173c9d6fee",
         "result_repr": "((), {'x': 2})",
+        "stable_graph": None,
     },
     "method_impure": {
         "graph": {
@@ -2488,6 +3236,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "meth-#0",
         "result_repr": "5",
+        "stable_graph": None,
     },
     "method_pure": {
         "graph": {
@@ -2518,6 +3267,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "meth-6d9278d378c00467d3ba03aa418b83bb",
         "result_repr": "5",
+        "stable_graph": None,
     },
     "nout_none": {
         "graph": {
@@ -2537,6 +3287,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "pair-edf96df724e6b75e10d11c374d451b9d",
         "result_repr": "(1, 2)",
+        "stable_graph": None,
     },
     "nout_one": {
         "graph": {
@@ -2556,6 +3307,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "single-78e46f9ea9925b4405e7a575deb859be",
         "result_repr": "(7,)",
+        "stable_graph": None,
     },
     "nout_one_element": {
         "graph": {
@@ -2599,6 +3351,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "getitem-fa6e2fe038607dc26095f08330271412",
         "result_repr": "7",
+        "stable_graph": None,
     },
     "nout_two": {
         "graph": {
@@ -2618,6 +3371,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "pair-edf96df724e6b75e10d11c374d451b9d",
         "result_repr": "(1, 2)",
+        "stable_graph": None,
     },
     "nout_two_getitem_one": {
         "graph": {
@@ -2661,6 +3415,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "getitem-ffab24e2d54dfb79b8c0089b214c60db",
         "result_repr": "2",
+        "stable_graph": None,
     },
     "nout_two_unpacked_first": {
         "graph": {
@@ -2704,6 +3459,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "getitem-df5a93d04a111fdac11aa82ac1ccc98e",
         "result_repr": "1",
+        "stable_graph": None,
     },
     "nout_two_unpacked_second": {
         "graph": {
@@ -2747,6 +3503,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "getitem-ffab24e2d54dfb79b8c0089b214c60db",
         "result_repr": "2",
+        "stable_graph": None,
     },
     "nout_zero": {
         "graph": {
@@ -2773,6 +3530,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "nothing-16d1ed9214c24df845518c080dc5dba0",
         "result_repr": "()",
+        "stable_graph": None,
     },
     "op_add": {
         "graph": {
@@ -2830,6 +3588,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "add-35cee928b5a34cf2c76c77e3106dd858",
         "result_repr": "5",
+        "stable_graph": None,
     },
     "op_getitem": {
         "graph": {
@@ -2873,6 +3632,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "getitem-5de6b0a227b247a33d30ed9e054db1c6",
         "result_repr": "2",
+        "stable_graph": None,
     },
     "op_lt": {
         "graph": {
@@ -2930,6 +3690,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "lt-f5c6fcf3a5a1622c4b88dfc936751cb3",
         "result_repr": "True",
+        "stable_graph": None,
     },
     "op_neg": {
         "graph": {
@@ -2973,6 +3734,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "neg-df7b95d9f5b8b840ed79dc3297c50e01",
         "result_repr": "-2",
+        "stable_graph": None,
     },
     "op_reflected_add": {
         "graph": {
@@ -3016,6 +3778,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "_swap-fe9fc34b1482c4119fa8e0dedc089afc",
         "result_repr": "3",
+        "stable_graph": None,
     },
     "traverse_false_with_delayed": {
         "graph": {
@@ -3031,6 +3794,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "quoted",
         "result_repr": "[Delayed('inc-5852f565112f1604bc52264ea5e287dc'), 1]",
+        "stable_graph": None,
     },
     "wrap_datanode": {
         "graph": {
@@ -3044,6 +3808,65 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "dn",
         "result_repr": "5",
+        "stable_graph": None,
+    },
+    "wrap_dict_with_delayed": {
+        "graph": {
+            "dask_keys": ["dict-060816f9d1dbe6ff4ba5f8a57d4c94ab"],
+            "dask_layers": ["dict-060816f9d1dbe6ff4ba5f8a57d4c94ab"],
+            "dependencies": [
+                [
+                    "dict-060816f9d1dbe6ff4ba5f8a57d4c94ab",
+                    [
+                        "inc-2f16cb15cc39d4668d79bfb484510bbb",
+                        "inc-5852f565112f1604bc52264ea5e287dc",
+                    ],
+                ],
+                ["inc-2f16cb15cc39d4668d79bfb484510bbb", []],
+                ["inc-5852f565112f1604bc52264ea5e287dc", []],
+            ],
+            "dependency_order": [
+                "dict-060816f9d1dbe6ff4ba5f8a57d4c94ab",
+                "inc-5852f565112f1604bc52264ea5e287dc",
+                "inc-2f16cb15cc39d4668d79bfb484510bbb",
+            ],
+            "key": "dict-060816f9d1dbe6ff4ba5f8a57d4c94ab",
+            "layer_order": [
+                "dict-060816f9d1dbe6ff4ba5f8a57d4c94ab",
+                "inc-5852f565112f1604bc52264ea5e287dc",
+                "inc-2f16cb15cc39d4668d79bfb484510bbb",
+            ],
+            "layers": [
+                [
+                    "dict-060816f9d1dbe6ff4ba5f8a57d4c94ab",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "dict-060816f9d1dbe6ff4ba5f8a57d4c94ab",
+                            "Dict",
+                            [
+                                "inc-2f16cb15cc39d4668d79bfb484510bbb",
+                                "inc-5852f565112f1604bc52264ea5e287dc",
+                            ],
+                            "to_container",
+                        ]
+                    ],
+                ],
+                [
+                    "inc-2f16cb15cc39d4668d79bfb484510bbb",
+                    "MaterializedLayer",
+                    [["inc-2f16cb15cc39d4668d79bfb484510bbb", "Task", [], "inc"]],
+                ],
+                [
+                    "inc-5852f565112f1604bc52264ea5e287dc",
+                    "MaterializedLayer",
+                    [["inc-5852f565112f1604bc52264ea5e287dc", "Task", [], "inc"]],
+                ],
+            ],
+        },
+        "key": "dict-060816f9d1dbe6ff4ba5f8a57d4c94ab",
+        "result_repr": "{'k': 2, 'j': 3}",
+        "stable_graph": None,
     },
     "wrap_func_pure": {
         "graph": {
@@ -3063,6 +3886,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "inc-303ca154fe489de9eadb7a14143fd6fd",
         "result_repr": None,
+        "stable_graph": None,
     },
     "wrap_int_default": {
         "graph": {
@@ -3078,6 +3902,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "int-#0",
         "result_repr": "3",
+        "stable_graph": None,
     },
     "wrap_int_named": {
         "graph": {
@@ -3093,6 +3918,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "three",
         "result_repr": "3",
+        "stable_graph": None,
     },
     "wrap_list_traverse_false_default": {
         "graph": {
@@ -3112,6 +3938,51 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "list-#0",
         "result_repr": "[1, 2]",
+        "stable_graph": None,
+    },
+    "wrap_list_with_delayed": {
+        "graph": {
+            "dask_keys": ["list-22dc33baac1c077dd729a2a207ff908e"],
+            "dask_layers": ["list-22dc33baac1c077dd729a2a207ff908e"],
+            "dependencies": [
+                ["inc-5852f565112f1604bc52264ea5e287dc", []],
+                [
+                    "list-22dc33baac1c077dd729a2a207ff908e",
+                    ["inc-5852f565112f1604bc52264ea5e287dc"],
+                ],
+            ],
+            "dependency_order": [
+                "inc-5852f565112f1604bc52264ea5e287dc",
+                "list-22dc33baac1c077dd729a2a207ff908e",
+            ],
+            "key": "list-22dc33baac1c077dd729a2a207ff908e",
+            "layer_order": [
+                "inc-5852f565112f1604bc52264ea5e287dc",
+                "list-22dc33baac1c077dd729a2a207ff908e",
+            ],
+            "layers": [
+                [
+                    "inc-5852f565112f1604bc52264ea5e287dc",
+                    "MaterializedLayer",
+                    [["inc-5852f565112f1604bc52264ea5e287dc", "Task", [], "inc"]],
+                ],
+                [
+                    "list-22dc33baac1c077dd729a2a207ff908e",
+                    "MaterializedLayer",
+                    [
+                        [
+                            "list-22dc33baac1c077dd729a2a207ff908e",
+                            "List",
+                            ["inc-5852f565112f1604bc52264ea5e287dc"],
+                            "to_container",
+                        ]
+                    ],
+                ],
+            ],
+        },
+        "key": "list-22dc33baac1c077dd729a2a207ff908e",
+        "result_repr": "[2, 1]",
+        "stable_graph": None,
     },
     "wrap_obj_pure": {
         "graph": {
@@ -3131,6 +4002,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "Obj-7fce9a01b4683ffac192d67366158c60",
         "result_repr": "Obj(v=3)",
+        "stable_graph": None,
     },
     "wrap_str_pure": {
         "graph": {
@@ -3150,6 +4022,7 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "str-2f63bc91734514c0b208c7332139c210",
         "result_repr": "'s'",
+        "stable_graph": None,
     },
     "wrap_taskref": {
         "graph": {
@@ -3163,24 +4036,184 @@ GOLDEN: dict[str, dict[str, Any]] = {
         },
         "key": "dn",
         "result_repr": None,
+        "stable_graph": None,
     },
 }
 # --- END GOLDEN ---
 
 
+#: Length of a bare dask token: 32 lowercase hex characters, which is both what
+#: ``tokenize`` produces and what ``uuid.uuid4().hex`` produces. The two cannot be
+#: told apart by shape, which is why the random ones are identified by observing
+#: two builds rather than by matching a pattern.
+_HEX_TOKEN_LEN = 32
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _walk_strings(value: Any) -> Iterator[str]:
+    """Yield every string of a canonical form, in a deterministic order.
+
+    Args:
+        value: A canonical-form fragment: a ``dict``, a ``list`` or a leaf.
+
+    Yields:
+        str: each string leaf, dicts in insertion order and lists in order, so
+        that two canonical forms of the same shape yield their strings in
+        corresponding positions.
+    """
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_strings(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _walk_strings(item)
+
+
+def _hex_tokens(graph: dict[str, Any]) -> list[str]:
+    """Return the 32-hex tokens of a canonical form, first appearance first.
+
+    Args:
+        graph: A canonical graph dict.
+
+    Returns:
+        list[str]: every distinct hyphen-delimited run of exactly 32 hex digits,
+        in the order the deterministic walk first reaches it. Both a ``tokenize``
+        digest and a ``uuid4().hex`` fallback have that shape; which is which is
+        decided by comparing two builds, not here.
+    """
+    tokens: list[str] = []
+    for text in _walk_strings(graph):
+        for part in text.split("-"):
+            if (
+                len(part) == _HEX_TOKEN_LEN
+                and _HEX_DIGITS.issuperset(part)
+                and part not in tokens
+            ):
+                tokens.append(part)
+    return tokens
+
+
+def _substitute(value: Any, replacements: dict[str, str]) -> Any:
+    """Replace token substrings throughout a canonical form.
+
+    Args:
+        value: A canonical-form fragment.
+        replacements: Token to placeholder.
+
+    Returns:
+        Any: the same structure with every occurrence of every token replaced,
+        and nothing else touched.
+    """
+    if isinstance(value, str):
+        for token, placeholder in replacements.items():
+            value = value.replace(token, placeholder)
+        return value
+    if isinstance(value, list):
+        return [_substitute(item, replacements) for item in value]
+    if isinstance(value, dict):
+        return {key: _substitute(item, replacements) for key, item in value.items()}
+    return value
+
+
+def _stable_graph(entry: _Expr) -> dict[str, Any]:
+    """Canonicalise a ``volatile_tokens`` entry into a reproducible form.
+
+    Some graphs carry an identifier that is random by construction:
+    ``dask._expr.HLGExpr.deterministic_token`` and
+    ``dask._expr.ProhibitReuse._suffix`` fall back to ``uuid.uuid4().hex``, and an
+    expression reached through a non-``Delayed`` collection picks one up. A bare
+    32-hex string cannot be recognised as random by shape -- a deterministic
+    token looks exactly the same -- so this function establishes which tokens are
+    random by *observation*: it builds the expression twice and replaces only the
+    tokens that actually changed, leaving every deterministic token, key, node
+    kind, dependency and insertion order exactly as canonicalised. That keeps the
+    whole graph under assertion for a path whose raw canonical dict could
+    otherwise not be compared at all.
+
+    Args:
+        entry: A corpus entry whose ``volatile_tokens`` flag is set.
+
+    Returns:
+        dict: the canonical graph with the ``i``-th random token replaced by
+        ``f"<hex{i}>"``.
+    """
+    first = canonical_graph(entry.build())
+    second = canonical_graph(entry.build())
+    first_tokens = _hex_tokens(first)
+    second_tokens = _hex_tokens(second)
+    assert len(first_tokens) == len(second_tokens), (
+        f"{entry.name}: two builds produced different numbers of 32-hex tokens "
+        f"({len(first_tokens)} and {len(second_tokens)}), so the graph differs by more "
+        "than its random identifiers"
+    )
+    volatile = [
+        (before, after)
+        for before, after in zip(first_tokens, second_tokens)
+        if before != after
+    ]
+    assert volatile, (
+        f"{entry.name} is flagged volatile_tokens but two builds produced identical "
+        "tokens; if the graph has become reproducible, drop the flag and record the "
+        "raw canonical form instead"
+    )
+    normalised = _substitute(
+        first, {before: f"<hex{i}>" for i, (before, _) in enumerate(volatile)}
+    )
+    assert normalised == _substitute(
+        second, {after: f"<hex{i}>" for i, (_, after) in enumerate(volatile)}
+    ), (
+        f"{entry.name}: the two builds still differ once their random tokens are "
+        "replaced, so something other than a random identifier moved"
+    )
+    return normalised
+
+
+def _golden_names(names: Sequence[Any]) -> list[Any]:
+    """Live graph names in the form the canonical golden fields record them.
+
+    ``canonical_graph`` records a key JSON can express as itself and encodes any
+    other key -- a ``tuple`` above all -- as its ``repr``
+    (``benchmarks/delayed_ab/canon.py``). The live ``HighLevelGraph`` holds the
+    keys themselves, so the same rule is applied before the two are compared. For
+    the string keys that make up most of the corpus it changes nothing, and for
+    the ``tuple``-keyed entry it is what lets the live insertion order be checked
+    against the golden at all.
+
+    Args:
+        names: Layer names or graph keys, in their live order.
+
+    Returns:
+        list: the same sequence with every non-JSON-expressible name replaced by
+        its ``repr``.
+    """
+    coerced: list[Any] = []
+    for name in names:
+        typ = type(name)
+        if name is None or typ is bool or typ is int or typ is float or typ is str:
+            coerced.append(name)
+        else:
+            coerced.append(repr(name))
+    return coerced
+
+
 def _golden_entry(entry: _Expr) -> dict[str, Any]:
-    """Build one corpus entry and return the three fields the golden records.
+    """Build one corpus entry and return the four fields the golden records.
 
     Args:
         entry: The corpus entry to characterise.
 
     Returns:
-        dict: ``{"key": ..., "graph": ..., "result_repr": ...}``. ``graph`` is the
-        full ``canonical_graph`` dict, or ``None`` for an entry whose canonical
-        form is not reproducible. ``result_repr`` is the ``repr`` of the
-        synchronously computed result, or ``None`` for an entry excluded from the
-        result assertions. Both exclusions are justified by name in
-        ``_EXCLUSION_REASONS``.
+        dict: ``{"key": ..., "graph": ..., "stable_graph": ..., "result_repr":
+        ...}``. ``graph`` is the full ``canonical_graph`` dict, or ``None`` for an
+        entry whose raw canonical form is not reproducible -- for which
+        ``stable_graph`` carries the same dict with only its observedly-random
+        32-hex tokens replaced, so that the graph is asserted either way.
+        ``result_repr`` is the ``repr`` of the synchronously computed result, or
+        ``None`` for an entry that cannot be computed, whose failure is asserted
+        from ``_COMPUTE_FAILURES`` instead. Every exclusion is justified by name
+        in ``_EXCLUSION_REASONS``.
 
     ``repr`` rather than the value itself, because a module-level dict literal
     can hold only source-representable values. The ordinary ``==`` comparison of
@@ -3192,6 +4225,7 @@ def _golden_entry(entry: _Expr) -> dict[str, Any]:
     return {
         "key": normalize_key(obj.key, table),
         "graph": canonical_graph(obj) if entry.canonical else None,
+        "stable_graph": _stable_graph(entry) if entry.volatile_tokens else None,
         "result_repr": repr(canonical_result([obj])[0]) if entry.computable else None,
     }
 
@@ -3230,7 +4264,7 @@ def write_golden() -> None:
     """Capture the golden fixture from the currently importable ``dask.delayed``.
 
     Builds every corpus entry under the same pins the autouse fixture applies,
-    records the three golden fields per entry, and rewrites *only* the text
+    records the four golden fields per entry, and rewrites *only* the text
     between the two marker comments in this module's own source, leaving every
     other byte untouched.
 
@@ -3311,15 +4345,44 @@ def test_characterisation(entry: _Expr) -> None:
             # ``Delayed``'s pickled slot state, ``HighLevelGraph`` included, so two
             # graphs with identical content in a different order tokenize
             # differently wherever a ``Delayed`` is reached through pickle.
-            assert list(materialised.layers) == golden["graph"]["layer_order"]
             assert (
-                list(materialised.dependencies) == golden["graph"]["dependency_order"]
+                _golden_names(list(materialised.layers))
+                == golden["graph"]["layer_order"]
             )
-            assert list(obj.__dask_keys__()) == golden["graph"]["dask_keys"]
-            assert list(obj.__dask_layers__()) == golden["graph"]["dask_layers"]
+            assert (
+                _golden_names(list(materialised.dependencies))
+                == golden["graph"]["dependency_order"]
+            )
+            assert (
+                _golden_names(list(obj.__dask_keys__())) == golden["graph"]["dask_keys"]
+            )
+            assert (
+                _golden_names(list(obj.__dask_layers__()))
+                == golden["graph"]["dask_layers"]
+            )
     else:
         assert golden["graph"] is None
         assert entry.name in _EXCLUSION_REASONS
+
+    if entry.volatile_tokens:
+        # The graph of an entry whose raw canonical form is not reproducible is
+        # asserted here in full, with only the identifiers a double build proves
+        # random replaced. Field by field first, then as a whole, exactly as
+        # above: every key, node kind, dependency and both insertion orders are
+        # compared, so a graph-shape regression on this path fails the suite.
+        stable = _stable_graph(entry)
+        golden_stable = golden["stable_graph"]
+        assert golden_stable is not None
+        assert stable["key"] == golden_stable["key"]
+        assert stable["dask_keys"] == golden_stable["dask_keys"]
+        assert stable["dask_layers"] == golden_stable["dask_layers"]
+        assert stable["layer_order"] == golden_stable["layer_order"]
+        assert stable["dependency_order"] == golden_stable["dependency_order"]
+        assert stable["layers"] == golden_stable["layers"]
+        assert stable["dependencies"] == golden_stable["dependencies"]
+        assert stable == golden_stable
+    else:
+        assert golden["stable_graph"] is None
 
     if entry.computable:
         (result,) = canonical_result([obj])
@@ -3496,13 +4559,32 @@ class _CountingKey:
     """A valid graph key that counts the ``repr()`` calls made on it."""
 
     def __repr__(self) -> str:
+        """Count one ``repr()`` call and return a fixed representation.
+
+        Returns:
+            str: a constant, so the count is the only thing that varies.
+        """
         _COUNTS["repr"] += 1
         return "_CountingKey()"
 
     def __hash__(self) -> int:
+        """Return a constant hash, making the object usable as a graph key.
+
+        Returns:
+            int: a fixed value. It is not counted: this class observes ``repr``
+            only, and hashing has to work for the object to be a key at all.
+        """
         return 4242
 
     def __eq__(self, other: object) -> bool:
+        """Compare by identity, so equal hashes never merge two distinct keys.
+
+        Args:
+            other: The object compared against.
+
+        Returns:
+            bool: True only for the very same instance.
+        """
         return self is other
 
 
@@ -3510,13 +4592,33 @@ class _CountingLayer:
     """A layer name object that counts the ``hash()`` calls made on it."""
 
     def __repr__(self) -> str:
+        """Return a fixed representation, uncounted.
+
+        Returns:
+            str: a constant. This class observes ``hash`` only, so its ``repr``
+            deliberately has no side effect.
+        """
         return "_CountingLayer()"
 
     def __hash__(self) -> int:
+        """Count one ``hash()`` call and return a constant hash.
+
+        Returns:
+            int: a fixed value, so every dict and set operation on this layer
+            name hashes to the same bucket and only the count varies.
+        """
         _COUNTS["hash"] += 1
         return 99
 
     def __eq__(self, other: object) -> bool:
+        """Compare by identity, so the constant hash cannot merge two names.
+
+        Args:
+            other: The object compared against.
+
+        Returns:
+            bool: True only for the very same instance.
+        """
         return self is other
 
 
@@ -3524,10 +4626,31 @@ class _CountingMeta(type):
     """Metaclass that counts ``==`` against the class and forbids ``hash()``."""
 
     def __eq__(cls, other: object) -> bool:
+        """Count one comparison against the class and compare by identity.
+
+        Args:
+            other: The object the class is compared against -- in practice each
+                element of the ``(list, tuple, set)`` membership test in
+                ``unpack_collections`` (``dask/delayed.py:206``).
+
+        Returns:
+            bool: True only when ``other`` is this very class.
+        """
         _COUNTS["eq"] += 1
         return cls is other
 
     def __hash__(cls) -> int:
+        """Fail: the construction path must never hash a type object.
+
+        Returns:
+            int: never -- the method always raises. A metaclass defining
+                ``__eq__`` has to define ``__hash__`` too, and raising here is
+                what turns "the branch cascade hashed a type" into a failure
+                instead of a silent behaviour change.
+
+        Raises:
+            AssertionError: always.
+        """
         raise AssertionError("the construction path must never hash a type object")
 
 
@@ -3636,6 +4759,66 @@ def test_dependency_layer_name_is_hashed_four_times_for_a_dict_graph() -> None:
     assert _COUNTS["hash"] == 4
 
 
+def test_attribute_chain_over_an_unsafe_ancestor_reprs_its_key_as_today() -> None:
+    """A ``DelayedAttr`` chain ``repr()``s an unsafe ancestor's key 2**depth times.
+
+    ``DelayedAttr.dask`` merges its parent's graph into its own, so the counts of
+    an *ancestor* are decided by how often the attribute's own graph is built.
+    ``HighLevelGraph._from_collection`` builds it twice -- once for the
+    ``is_dask_collection`` probe, once for the merge -- and each level of the
+    chain doubles the level below it, so a user-defined key at the root of the
+    chain is ``repr()``-ed 1, 2, 4 and 8 times for chains of length 0, 1, 2 and 3
+    (all four measured on the pre-refactor module).
+
+    The counts are therefore a behavioural contract for attribute chains, not an
+    implementation detail: a construction path that fast-paths the attribute on
+    its own primitive key and layer name while an ancestor is unsafe would report
+    1 at every depth. Building the chain itself ``repr()``s the key too -- every
+    ``DelayedAttr.__init__`` tokenizes its parent -- which is why the counter is
+    reset once the chain stands.
+    """
+    for depth, expected in ((0, 1), (1, 2), (2, 4), (3, 8)):
+        key = _CountingKey()
+        dependency: Delayed = Delayed(key, {key: DataNode(key, 5)})
+        for _ in range(depth):
+            dependency = dependency.attr
+
+        _COUNTS["repr"] = 0
+        delayed(ident, name="ident")(dependency)
+
+        assert _COUNTS["repr"] == expected, f"attribute chain of length {depth}"
+
+
+def test_attribute_chain_over_an_unsafe_ancestor_hashes_its_layer_as_today() -> None:
+    """The same chain hashes an unsafe ancestor's layer name exactly as today.
+
+    The hash sites are the ones the two graph-shape tests above enumerate, and
+    the doubling of the previous test applies to them as well -- with one extra
+    hash per level, because the attribute's own merged graph re-inserts the
+    ancestor's layer name into the layer and dependency dicts it copies. Measured
+    on the pre-refactor module: 2, 5 and 11 hashes for chains of length 0, 1
+    and 2.
+    """
+    for depth, expected in ((0, 2), (1, 5), (2, 11)):
+        layer_name = _CountingLayer()
+        # ``HighLevelGraph`` declares its layer names as ``str`` while the runtime
+        # accepts -- and this test requires -- an arbitrary hashable object.
+        layers: dict[Any, Any] = {layer_name: {"dkey": DataNode("dkey", 5)}}
+        layer_dependencies: dict[Any, Any] = {layer_name: set()}
+        dependency: Delayed = Delayed(
+            "dkey",
+            HighLevelGraph(layers, layer_dependencies),
+            layer=layer_name,
+        )
+        for _ in range(depth):
+            dependency = dependency.attr
+
+        _COUNTS["hash"] = 0
+        delayed(ident, name="ident")(dependency)
+
+        assert _COUNTS["hash"] == expected, f"attribute chain of length {depth}"
+
+
 def test_unpack_collections_compares_types_three_times_and_never_hashes() -> None:
     """``unpack_collections`` compares the value's type three times, hashing none.
 
@@ -3694,6 +4877,264 @@ def test_nominal_immutability_asymmetry_is_preserved() -> None:
         other._key
 
 
+def test_every_entry_asserts_its_graph() -> None:
+    """No corpus entry may opt out of graph comparison altogether.
+
+    An entry whose raw canonical dict is reproducible is compared verbatim
+    (``canonical=True``); one that carries an inherently random identifier is
+    compared after that identifier is normalised out (``volatile_tokens=True``).
+    There is no third option: a graph nobody compares is a graph in which a shape
+    regression passes unnoticed, which is precisely what this corpus exists to
+    prevent.
+    """
+    unasserted = [
+        entry.name for entry in CORPUS if not (entry.canonical or entry.volatile_tokens)
+    ]
+    assert not unasserted, f"these entries assert no graph at all: {unasserted}"
+
+    volatile = {entry.name for entry in CORPUS if entry.volatile_tokens}
+    assert volatile, "the volatile-token path must stay covered by at least one entry"
+    for name in volatile:
+        entry = _by_name(name)
+        # The flag exists because the raw dict is *not* reproducible; an entry
+        # that sets both would be recording two versions of the same thing.
+        assert not entry.canonical, name
+        assert GOLDEN[name]["graph"] is None, name
+        assert GOLDEN[name]["stable_graph"] is not None, name
+
+
+def test_non_runnable_entries_fail_exactly_as_they_did() -> None:
+    """Every entry that cannot be computed fails with its recorded exception.
+
+    ``computable=False`` is not permission to ignore what the expression does: a
+    path whose result is an exception has the exception asserted -- exact type,
+    exact message -- so that a change of failure mode is caught as readily as a
+    change of value. All four are dangling-reference or unsupported-graph cases
+    in the *current* module, measured on the pre-refactor code.
+    """
+    for name, (expected_type, message) in _COMPUTE_FAILURES.items():
+        entry = _by_name(name)
+        assert not entry.computable, f"{name} computes; drop it from _COMPUTE_FAILURES"
+        assert name in _EXCLUSION_REASONS, name
+        obj = entry.build()
+        with pytest.raises(expected_type) as excinfo:
+            canonical_result([obj])
+        # Exact type, not a subclass, and the whole message rather than a
+        # fragment of it.
+        assert type(excinfo.value) is expected_type, name
+        assert str(excinfo.value) == message, name
+
+
+def test_no_finalize_result_exists_to_characterise() -> None:
+    """``finalize()`` cannot be computed for *any* collection at this commit.
+
+    This test exists because of what it forecloses. The corpus is required to
+    characterise ``dask.delayed.finalize`` of a non-``Delayed`` collection, and a
+    characterisation would normally pin the computed result; ``finalize_collection``
+    cannot, and the reason is not a property of the chosen collection. ``finalize``
+    stores ``collections_to_expr(collection).finalize_compute()`` -- an
+    ``HLGFinalizeCompute`` expression -- in the ``Delayed``, and computing any such
+    object reaches ``collection.dask.copy()`` in ``dask._expr``, which an
+    expression does not provide.
+
+    Four collections are tried here, deliberately covering every shape available
+    without an optional dependency: a hand-rolled collection with a plain ``dict``
+    low-level graph, a hand-rolled collection with a ``HighLevelGraph``, a
+    ``Delayed``, and -- when NumPy is installed -- a ``dask.array``. All four fail
+    identically. There is therefore no successful pre-refactor result to capture
+    for this path, which is recorded here rather than passed over: the graph is
+    asserted in full through ``stable_graph``, the failure verbatim through
+    ``_COMPUTE_FAILURES``, and a future release that makes ``finalize`` computable
+    will fail this test and prompt the golden to gain a result.
+    """
+    expected_type, message = _COMPUTE_FAILURES["finalize_collection"]
+
+    candidates: list[tuple[str, Any]] = [
+        ("dict-graph collection", _hand_rolled_collection()),
+        ("HighLevelGraph collection", _hlg_backed_collection()),
+        ("Delayed", _leaf()),
+    ]
+    try:
+        import numpy
+
+        import dask.array as da
+    except ImportError:  # pragma: no cover - exercised only without NumPy
+        pass
+    else:
+        candidates.append(("dask.array", da.from_array(numpy.arange(4), chunks=2)))
+
+    with dask.config.set({"delayed_pure": True}):
+        for label, collection in candidates:
+            wrapped = finalize(collection)
+            assert type(wrapped) is Delayed, label
+            assert wrapped.key.startswith("finalize-"), label
+            assert (
+                type(wrapped.__dask_graph__()).__name__ == "HLGFinalizeCompute"
+            ), label
+            with pytest.raises(expected_type) as excinfo:
+                canonical_result([wrapped])
+            assert type(excinfo.value) is expected_type, label
+            assert str(excinfo.value) == message, label
+
+
+def test_canonicaliser_refuses_a_key_it_cannot_encode_reproducibly() -> None:
+    """A key outside the encodable types is refused, never repr-ed into evidence.
+
+    The canonical form is committed evidence, so a key whose textual form carries
+    object identity -- a default ``object.__repr__`` embeds a memory address --
+    must not reach it. Three shapes are refused, and the third is the reason the
+    refusal is built from type metadata rather than from the object: a key whose
+    ``__repr__`` raises would otherwise replace the diagnosis with an unrelated
+    exception.
+    """
+    for label, key in (
+        ("opaque object", _OpaqueKey()),
+        ("tuple subclass with custom iteration", _IdentityYieldingTuple(("tk", 0))),
+        ("key whose repr raises", _RaisingReprKey()),
+    ):
+        dependency = Delayed(key, {key: DataNode(key, 5)})
+        with pytest.raises(TypeError) as excinfo:
+            canonical_graph(dependency)
+        assert "cannot canonicalise a graph key of type" in str(excinfo.value), label
+        # The rejection names the type, and nothing of the object itself.
+        assert type(key).__qualname__ in str(excinfo.value), label
+
+    # The encodable shapes still go through, byte for byte as before.
+    plain: Any = ("tk", 0)
+    encodable = Delayed(plain, {plain: DataNode(plain, 5)})
+    assert canonical_graph(encodable)["key"] == "('tk', 0)"
+
+
+def test_impure_fan_in_canonicalises_identically_on_two_builds() -> None:
+    """Placeholder numbering does not depend on the random tokens themselves.
+
+    A node with several impure dependencies sharing one key prefix is the case
+    that decides how a node's dependencies may be ordered while they are being
+    numbered: ordering them by their raw keys orders them by their UUID tokens,
+    so two builds of the same expression -- and therefore the two arms of the A/B
+    suite -- would produce different placeholder numbers and different
+    ``layer_order`` fields for identical graphs. This asserts the invariant the
+    canonicaliser's ordering exists to provide.
+    """
+
+    def build() -> Any:
+        leaves = [delayed(inc, pure=False)(i) for i in range(6)]
+        return delayed(ident, pure=False)(*leaves)
+
+    first = canonical_graph(build())
+    second = canonical_graph(build())
+    assert first == second
+    # And the placeholders really are in play: every key here carries a UUID.
+    assert first["key"].endswith("-#0")
+    assert len(first["layer_order"]) == 7
+
+
+def test_tuple_key_with_a_non_builtin_element_falls_back() -> None:
+    """A tuple key holding a non-builtin element keeps the generic merge path.
+
+    A key guard that treats a key as "builtin" has to recurse into a ``tuple``
+    and reject the whole key on the first element that is not a builtin scalar.
+    What rides on it is observable: the generic
+    ``HighLevelGraph.from_collections`` probes each dependency with
+    ``is_dask_collection``, which builds a throw-away ``DelayedAttr(c, "expr")``
+    whose ``tokenize`` ``repr()``\\ s the dependency's key
+    (``dask/tokenize.py:33-39``). One ``repr`` call is therefore the pre-refactor
+    behaviour for such a key -- measured -- and a shortcut that accepted the
+    tuple would make that call disappear.
+
+    The key cannot go into ``GOLDEN``: it holds an object, so it is neither
+    JSON-expressible nor safe to serialise (the canonicaliser refuses a key it
+    cannot encode reproducibly). The graph is therefore asserted here, directly.
+    """
+    # Annotated ``Any`` for the same reason the counting-layer tests are:
+    # ``HighLevelGraph`` declares its layer names as ``str`` while the runtime
+    # accepts -- and this test requires -- an arbitrary hashable object.
+    key: Any = ("tk", _CountingKey())
+    dependency = Delayed(key, {key: DataNode(key, 5)})
+
+    _COUNTS["repr"] = 0
+    result = delayed(ident, name="ident")(dependency)
+
+    assert _COUNTS["repr"] == 1
+
+    graph = result.dask
+    assert isinstance(graph, HighLevelGraph)
+    # Insertion order: new-then-existing, the order a single dependency carrying
+    # a plain ``dict`` low-level graph produces
+    # (``dask/highlevelgraph.py:462-465``).
+    layer_names = list(graph.layers)
+    assert len(layer_names) == 2
+    assert layer_names[0] == result.key
+    assert layer_names[1] is key
+    assert list(graph.dependencies) == [result.key, key]
+    assert graph.dependencies[result.key] == {key}
+    assert graph.dependencies[key] == set()
+    # The key object itself -- not a copy and not its repr -- still names the
+    # dependency's layer and its node.
+    assert [node_key is key for node_key in dict(graph.layers[key])] == [True]
+    assert list(result.__dask_keys__()) == [result.key]
+    assert tuple(result.__dask_layers__()) == (result.key,)
+    assert canonical_result([result]) == ((5,),)
+
+
+def test_sequence_without_a_collection_detects_dependent_nodes() -> None:
+    """A container holding a task-spec node is not handed back unchanged.
+
+    The container branch of ``unpack_collections`` short-circuits -- returning the
+    object itself with no collections -- only when nothing inside it contributes a
+    graph dependency. A bare ``TaskRef`` contributes one, and so does a runnable
+    node whose own ``dependencies`` are non-empty; a node without dependencies
+    does not. All three verdicts are asserted together, because they are the
+    three arms of the same decision.
+    """
+    task, collections = unpack_collections([TaskRef("dn"), 1])
+    assert type(task).__name__ == "List"
+    assert task.dependencies == {"dn"}
+    assert collections == ()
+
+    task, collections = unpack_collections([Task("inner", ident, TaskRef("dn")), 1])
+    assert type(task).__name__ == "List"
+    assert task.dependencies == {"dn"}
+    assert collections == ()
+
+    # A ``GraphNode`` with no dependencies of its own leaves the short-circuit
+    # intact: the list is the task.
+    literal_node = [DataNode("dn3", 7), 1]
+    task, collections = unpack_collections(literal_node)
+    assert task is literal_node
+    assert collections == ()
+
+    literal = [1, 2]
+    task, collections = unpack_collections(literal)
+    assert task is literal
+    assert collections == ()
+
+
+def test_traversed_container_wrap_rewrites_the_container_node_key() -> None:
+    """``delayed([a])`` keys the container node after the wrapper itself.
+
+    Wrapping a traversed non-callable whose traversal produced a task takes the
+    second branch of ``delayed()``: the node built by ``unpack_collections``
+    carries no key of its own, so the wrapper's generated name is written onto it
+    and becomes the single key of the new layer. ``GOLDEN`` compares the whole
+    graph of both entries; this test names the property that makes the graph
+    valid at all, on the live node object.
+    """
+    for name, kind, dependency_count in (
+        ("wrap_list_with_delayed", "List", 1),
+        ("wrap_dict_with_delayed", "Dict", 2),
+    ):
+        obj = _by_name(name).build()
+        graph = obj.__dask_graph__()
+        assert isinstance(graph, HighLevelGraph)
+        node = graph.layers[obj.key][obj.key]
+        assert type(node).__name__ == kind
+        assert node.key == obj.key
+        assert graph.dependencies[obj.key] == set(node.dependencies)
+        assert len(node.dependencies) == dependency_count
+        assert len(graph.layers) == dependency_count + 1
+
+
 # ---------------------------------------------------------------------------
 # Errors and warnings.
 # ---------------------------------------------------------------------------
@@ -3710,12 +5151,31 @@ class _MultiKeyCollection:
     """
 
     def __init__(self, expr: Any) -> None:
+        """Store the multi-output expression this collection exposes.
+
+        Args:
+            expr: A real ``Expr`` -- an ``_ExprSequence`` over two single-key
+                expressions -- published as ``self.expr`` so that
+                ``is_dask_collection`` accepts the wrapper and
+                ``collections_to_expr`` uses the expression as it stands.
+        """
         self.expr = expr
 
     def __dask_graph__(self) -> Any:
+        """Return the wrapped expression's graph.
+
+        Returns:
+            Any: whatever the expression materialises, delegated unchanged.
+        """
         return self.expr.__dask_graph__()
 
     def __dask_keys__(self) -> Any:
+        """Return the wrapped expression's keys.
+
+        Returns:
+            Any: both output keys, delegated unchanged -- which is what makes
+            finalizing this collection produce more than one key.
+        """
         return self.expr.__dask_keys__()
 
 
@@ -3737,39 +5197,93 @@ _STRICT_DETERMINISTIC: tuple[str, ...] = (
 
 @pytest.mark.parametrize("bad", [-1, "x", 1.5])
 def test_nout_must_be_none_or_a_non_negative_int(bad: object) -> None:
-    """``nout`` validation (``dask/delayed.py:627-628``)."""
-    with pytest.raises(
-        ValueError, match="nout must be None or a non-negative integer, got"
-    ):
+    """``nout`` validation (``dask/delayed.py:627-628``).
+
+    The whole message is compared, offending value included, because the value is
+    interpolated into it: a fragment match would still pass if the interpolation
+    were dropped, reworded or moved.
+    """
+    with pytest.raises(ValueError) as excinfo:
         delayed(inc, name="inc", nout=bad)
+    assert (
+        str(excinfo.value) == f"nout must be None or a non-negative integer, got {bad}"
+    )
+
+
+def test_nout_zero_is_a_length_of_zero_not_an_absent_length() -> None:
+    """``nout=0`` keeps a zero length (``:627-628``, ``:771-780``, ``:826``).
+
+    ``nout`` is validated as "None or a non-negative int" and stored verbatim in
+    ``_length``, so zero and ``None`` are two different states: zero makes the
+    ``Delayed`` a sized, iterable object with no elements, ``None`` makes it
+    neither. Coercing one to the other -- the natural mistake for a falsy value on
+    a construction path being rewritten -- would leave the golden key, graph and
+    computed result of the ``nout_zero`` corpus entry untouched, so it is asserted
+    here instead.
+    """
+    obj = delayed(nothing, name="nothing", pure=True, nout=0)()
+
+    assert obj._length == 0
+    assert obj._length is not None, "zero must not be stored, or read back, as None"
+    assert len(obj) == 0
+    assert list(obj) == []
+    (result,) = canonical_result([obj])
+    assert result == ()
+
+    # The contrast that gives the assertions above their meaning: the same
+    # callable without ``nout`` has no length at all and raises on both.
+    absent = delayed(nothing, name="nothing", pure=True)()
+    assert absent._length is None
+    with pytest.raises(TypeError) as excinfo:
+        len(absent)
+    assert str(excinfo.value) == "Delayed objects of unspecified length have no len()"
 
 
 def test_delayed_rejects_a_layer_absent_from_its_high_level_graph() -> None:
-    """``Delayed.__init__`` validates ``layer`` against the HLG (``:688-691``)."""
+    """``Delayed.__init__`` validates ``layer`` against the HLG (``:688-691``).
+
+    The message carries both the offending layer and the graph's actual layer
+    list, so it is compared in full.
+    """
     graph = _hlg_of("present")
-    with pytest.raises(ValueError, match="not in the HighLevelGraph's layers"):
+    with pytest.raises(ValueError) as excinfo:
         Delayed("present", graph, layer="absent")
+    assert (
+        str(excinfo.value)
+        == "Layer absent not in the HighLevelGraph's layers: ['present']"
+    )
 
 
 def test_truth_iteration_and_length_raise_without_nout() -> None:
-    """``bool``/iteration/``len`` on a length-less ``Delayed`` (``:771-789``)."""
+    """``bool``/iteration/``len`` on a length-less ``Delayed`` (``:771-789``).
+
+    Each message is compared in full, ``len()``'s trailing parentheses included:
+    the three are the module's whole vocabulary for "this object has no length",
+    and a fragment match cannot tell them apart from a reworded variant.
+    """
     obj = _leaf()
-    with pytest.raises(TypeError, match="Truth of Delayed objects is not supported"):
+    with pytest.raises(TypeError) as truth:
         bool(obj)
+    assert str(truth.value) == "Truth of Delayed objects is not supported"
     # ``__iter__`` is a generator function, so the body -- and the raise -- only
     # runs once the iterator is advanced.
-    with pytest.raises(
-        TypeError, match="Delayed objects of unspecified length are not iterable"
-    ):
+    with pytest.raises(TypeError) as iteration:
         list(obj)
-    with pytest.raises(
-        TypeError, match="Delayed objects of unspecified length have no len"
-    ):
+    assert (
+        str(iteration.value) == "Delayed objects of unspecified length are not iterable"
+    )
+    with pytest.raises(TypeError) as length:
         len(obj)
+    assert str(length.value) == "Delayed objects of unspecified length have no len()"
 
 
 def test_dataclass_with_a_set_init_false_field_raises_value_error() -> None:
-    """A set ``init=False`` field cannot be reconstructed (``:270-275``)."""
+    """A set ``init=False`` field cannot be reconstructed (``:270-275``).
+
+    The message names the offending type, so it is rebuilt from the class object
+    and compared in full -- a fragment match would not notice the type being
+    dropped from it, which is the part that makes the error actionable.
+    """
 
     @dataclass
     class ADataClass:
@@ -3777,48 +5291,101 @@ def test_dataclass_with_a_set_init_false_field_raises_value_error() -> None:
         b: int = field(init=False)
 
     def prepare(a: Any) -> ADataClass:
+        """Build an instance whose ``init=False`` field has been set.
+
+        Args:
+            a: Value for the ordinary field, here a ``Delayed`` so the instance
+                reaches the dataclass branch of ``unpack_collections``.
+
+        Returns:
+            ADataClass: an instance with ``b`` assigned after construction, which
+            is what makes ``replace()`` fail.
+        """
         data = ADataClass(a=a)
         data.b = 4
         return data
 
-    with pytest.raises(ValueError, match="`init=False` are not supported") as excinfo:
+    with pytest.raises(ValueError) as excinfo:
         delayed(prepare(_leaf()))
 
-    assert excinfo.match("ADataClass")
+    assert str(excinfo.value) == (
+        f"Failed to unpack {ADataClass} instance. "
+        "Note that using fields with `init=False` are not supported."
+    )
     # The code chains the original ``replace()`` failure, whichever of the two
     # types it raised.
     assert isinstance(excinfo.value.__cause__, (ValueError, TypeError))
 
 
 def test_dataclass_with_a_custom_init_raises_type_error() -> None:
-    """A custom ``__init__`` cannot be reconstructed (``:276-280``)."""
+    """A custom ``__init__`` cannot be reconstructed (``:276-280``).
+
+    Compared in full for the same reason as its ``init=False`` sibling, and the
+    two complete messages together prove the branch still discriminates between
+    the two failure modes rather than reporting one for both.
+    """
 
     @dataclass
     class ADataClass:
         a: Any
 
         def __init__(self, b: Any) -> None:
+            """Assign ``b`` to the single field, which ``replace()`` cannot call.
+
+            Args:
+                b: Value stored as ``self.a``. The parameter name deliberately
+                    differs from the field name, so ``replace()`` -- which calls
+                    the constructor with field names -- raises ``TypeError``.
+            """
             self.a = b
 
-    with pytest.raises(TypeError, match="custom __init__ is not supported") as excinfo:
+    with pytest.raises(TypeError) as excinfo:
         delayed({"data": ADataClass(b=_leaf())})
 
-    assert excinfo.match("ADataClass")
+    assert str(excinfo.value) == (
+        f"Failed to unpack {ADataClass} instance. "
+        "Note that using a custom __init__ is not supported."
+    )
     assert isinstance(excinfo.value.__cause__, TypeError)
 
 
 def test_private_attribute_access_raises_attribute_error() -> None:
-    """Underscore-prefixed attributes are not lazily wrapped (``:744-745``)."""
+    """Underscore-prefixed attributes are not lazily wrapped (``:744-745``).
+
+    The attribute name is interpolated into the message, so the whole message is
+    compared: the name is how a user finds the typo that caused it.
+    """
     obj = _leaf()
-    with pytest.raises(AttributeError, match="Attribute _foo not found"):
+    with pytest.raises(AttributeError) as excinfo:
         obj._foo
+    assert str(excinfo.value) == "Attribute _foo not found"
 
 
 def test_visualise_typo_warns_and_still_returns_a_delayed_attr() -> None:
-    """The ``visualise`` spelling guard warns *and* keeps working (``:747-755``)."""
+    """The ``visualise`` spelling guard warns *and* keeps working (``:747-755``).
+
+    Both halves of the guard are asserted: the complete message -- including the
+    suggested spelling, which is the entire point of the warning -- and the
+    ``DelayedAttr`` that access still returns afterwards. The origin is checked
+    too, and deliberately against ``dask/delayed.py`` rather than against this
+    file: this ``warnings.warn`` call passes no ``stacklevel``, so the warning is
+    attributed to the module that raises it, the opposite of the ``to_task_dask``
+    warning below. Only the file is asserted, never a line number in a module
+    this run is refactoring.
+    """
     obj = _leaf()
-    with pytest.warns(UserWarning, match="Perhaps you meant"):
+    with pytest.warns(UserWarning) as record:
         attribute = obj.visualise
+    assert len(record) == 1
+    assert record[0].category is UserWarning
+    assert str(record[0].message) == (
+        "dask.delayed objects have no `visualise` method. "
+        "Perhaps you meant `visualize`?"
+    )
+    assert (
+        Path(record[0].filename).resolve()
+        == Path(Delayed.__getattr__.__code__.co_filename).resolve()
+    )
     assert isinstance(attribute, DelayedAttr)
     assert attribute._attr == "visualise"
 
@@ -3828,10 +5395,42 @@ def test_to_task_dask_still_warns_and_still_works() -> None:
 
     ``pytest.warns`` both asserts and consumes the warning, so the test stays
     clean under the project's warnings-as-errors configuration.
+
+    The ``stacklevel=2`` the shim passes is part of the frozen contract, and it
+    is the one property of a warning that no message comparison can see, so it is
+    asserted through the recorded origin: the user-facing warning must be
+    attributed to *this file* and to the line that calls ``to_task_dask``. Level 1
+    would point at ``dask/delayed.py`` and level 3 at pytest's own call frame, so
+    both directions of drift fail. The expected line is read back out of this
+    module's source rather than hard-coded, so inserting a line above cannot
+    break it.
     """
+    expected = (
+        "The dask.delayed.to_dask_dask function has been "
+        "Deprecated in favor of unpack_collections"
+    )
     a = delayed(1, name="a")
-    with pytest.warns(UserWarning, match="has been Deprecated"):
+    with pytest.warns(UserWarning) as record:
         task, graph = to_task_dask([a, 3])
+    warnings_raised = list(record)
+    # One warning per invocation, measured: the shim recurses into each element of
+    # the list and warns again on every recursive call, so a two-element list
+    # yields three warnings rather than one.
+    assert len(warnings_raised) == 3
+    assert {warning.category for warning in warnings_raised} == {UserWarning}
+    assert {str(warning.message) for warning in warnings_raised} == {expected}
+    # The user's own call is the first one, and ``stacklevel=2`` attributes it to
+    # the caller's frame -- this file, at the calling line.
+    assert Path(warnings_raised[0].filename).resolve() == Path(__file__).resolve()
+    source = Path(__file__).read_text().splitlines()
+    assert "to_task_dask([a, 3])" in source[warnings_raised[0].lineno - 1]
+    # The recursive warnings are attributed to the shim's own frame, because for a
+    # call made from inside the module that is what level 2 points at.
+    for warning in warnings_raised[1:]:
+        assert (
+            Path(warning.filename).resolve()
+            == Path(to_task_dask.__code__.co_filename).resolve()
+        )
     assert task == ["a", 3]
     assert dict(graph) == dict(a.dask)
 
@@ -3841,24 +5440,31 @@ def test_a_task_used_as_a_task_callable_raises() -> None:
 
     ``Task.__init__`` raises when its ``func`` is itself a ``Task``
     (``dask/_task_spec.py:657-659``), and the error surfaces unchanged through
-    ``call_function``.
+    ``call_function`` -- unchanged including its message, which is asserted whole.
     """
-    with pytest.raises(TypeError, match="Cannot nest tasks"):
+    with pytest.raises(TypeError) as excinfo:
         delayed(Task("t", inc, 1), name="t")(2)
+    assert str(excinfo.value) == "Cannot nest tasks"
 
 
 def test_collection_that_does_not_finalize_to_one_key_raises() -> None:
-    """A multi-output collection is refused with the documented message (``:184-189``)."""
+    """A multi-output collection is refused with the documented message (``:184-189``).
+
+    The message interpolates both the collection's type and its finalized keys
+    (``f"... with {keys=}"``), and both are what tell a user which collection to
+    reduce, so the whole string is compared.
+    """
     a = delayed(1, name="a")
     b = delayed(2, name="b")
     collection = _MultiKeyCollection(
         _ExprSequence(collections_to_expr(a), collections_to_expr(b))
     )
-    with pytest.raises(
-        RuntimeError,
-        match="Cannot unpack dask collections which don't finalize to a single key",
-    ):
+    with pytest.raises(RuntimeError) as excinfo:
         unpack_collections(collection)
+    assert str(excinfo.value) == (
+        "Cannot unpack dask collections which don't finalize to a "
+        f"single key. Got {_MultiKeyCollection} with keys=['a', 'b']"
+    )
 
 
 def test_strict_mode_raises_tokenization_error_for_a_generator() -> None:
@@ -3870,12 +5476,23 @@ def test_strict_mode_raises_tokenization_error_for_a_generator() -> None:
     the module-local ``tokenize`` wrapper (``dask/delayed.py:408``). The strict
     flag is read from the ``_ENSURE_DETERMINISTIC`` ContextVar first and the
     configuration key second, so ``dask.config.set`` is the right trigger.
+
+    The message names the object that could not be hashed, so the expectation is
+    built from that object's own ``repr`` -- the one dynamic value in it -- and
+    the complete string is then compared. A fragment match would pass even if the
+    offending object were no longer reported.
     """
+    generator = _generate()
+    expected = (
+        f"Object {generator!r} cannot be deterministically hashed. This likely "
+        "indicates that the object cannot be serialized deterministically."
+    )
     with (
         dask.config.set({"tokenize.ensure-deterministic": True}),
-        pytest.raises(TokenizationError, match="cannot be deterministically hashed"),
+        pytest.raises(TokenizationError) as excinfo,
     ):
-        delayed(ident, name="ident", pure=True)(_generate())
+        delayed(ident, name="ident", pure=True)(generator)
+    assert str(excinfo.value) == expected
 
 
 @pytest.mark.parametrize("name", _STRICT_DETERMINISTIC)
@@ -3915,14 +5532,142 @@ def test_no_silent_flip_nondeterministic_stays_nondeterministic() -> None:
 
 # ---------------------------------------------------------------------------
 # Cross-scheduler equality and serializability.
+#
+# ``computable`` says only "this entry has a stable golden ``result_repr``". It
+# is not a statement that the entry has no result worth checking, and it has
+# nothing to do with whether the object pickles. The two tables below give the
+# entries without a golden repr the assertion that *is* stable about them --
+# a function identity, or an exception -- so the whole corpus takes part in the
+# cross-scheduler and round-trip evidence, and the pickle round trip is gated on
+# ``picklable`` alone.
 # ---------------------------------------------------------------------------
 
 
-def test_results_match_across_schedulers() -> None:
-    """The computable corpus computes identically under ``sync`` and ``threads``.
+#: Entries whose computed value is, or contains, a function object. Their value
+#: is perfectly stable -- the same module-level function, by identity -- but its
+#: ``repr`` embeds a memory address, which is the only reason they carry no
+#: golden ``result_repr``. They are therefore compared by the module-qualified
+#: name ``_result_signature`` produces, which is stable across schedulers, across
+#: a pickle round trip and across processes.
+_FUNCTION_VALUED_RESULTS: dict[str, Any] = {
+    "wrap_func_pure": "dask.utils_test.inc",
+    "arg_delayed_leaf": ("dask.utils_test.inc",),
+}
 
-    The synchronous leg goes through ``canonical_result`` so that this test and
-    the A/B harness share one definition of "the result of an expression".
+#: Entries that are deliberately not runnable, with the exception type and the
+#: message prefix that computing one raises. ``wrap_taskref`` wraps a ``TaskRef``,
+#: a pointer to a key rather than a runnable node, so the scheduler cannot find
+#: ``'dn'``; ``finalize_collection``'s graph is an ``HLGFinalizeCompute``
+#: expression rather than a container, which the scheduler cannot copy;
+#: ``arg_list_with_taskref`` and ``arg_list_with_dependent_task`` place a node
+#: depending on ``'dn'`` inside a list argument, so the graph is rejected for the
+#: missing dependency before anything runs. Raising is their observable
+#: behaviour, so it is asserted rather than stepped around. Only the prefix is
+#: pinned here -- the remainder of each message is dask's own generic advice or
+#: the expression's own key, both recorded in full in ``_COMPUTE_FAILURES`` --
+#: and equality between the two schedulers and across the pickle round trip is
+#: asserted separately.
+_NON_RUNNABLE_RESULTS: dict[str, tuple[type[BaseException], str]] = {
+    "wrap_taskref": (KeyError, "'dn'"),
+    "finalize_collection": (
+        AttributeError,
+        "'HLGFinalizeCompute' object has no attribute 'copy'",
+    ),
+    "arg_list_with_taskref": (
+        ValueError,
+        "Missing dependency dn for dependents ",
+    ),
+    "arg_list_with_dependent_task": (
+        ValueError,
+        "Missing dependency dn for dependents ",
+    ),
+}
+
+
+def _result_signature(value: Any) -> Any:
+    """Return a representation-independent signature of a computed value.
+
+    Args:
+        value: A computed result, possibly a list or tuple holding callables.
+
+    Returns:
+        Any: ``"<module>.<qualname>"`` for a callable, the same container kind
+        holding the signatures of its elements for a list or a tuple, and the
+        value itself for anything else. Only callables need this treatment: they
+        compare equal by identity but their ``repr`` varies between processes.
+    """
+    if isinstance(value, tuple):
+        return tuple(_result_signature(item) for item in value)
+    if isinstance(value, list):
+        return [_result_signature(item) for item in value]
+    qualname = getattr(value, "__qualname__", None)
+    if callable(value) and isinstance(qualname, str):
+        return f"{getattr(value, '__module__', None)}.{qualname}"
+    return value
+
+
+def _computed_exception(obj: Any, scheduler: str) -> BaseException:
+    """Compute an expression that is expected to fail and return its exception.
+
+    Args:
+        obj: The ``Delayed`` to compute.
+        scheduler: Scheduler name passed to ``dask.compute``.
+
+    Returns:
+        BaseException: the exception the computation raised.
+
+    Raises:
+        AssertionError: if the computation succeeded. A deliberately non-runnable
+            path that quietly became runnable is a behaviour change, so it fails
+            here rather than being reported as a pass.
+    """
+    try:
+        dask.compute(obj, scheduler=scheduler)
+    except Exception as error:
+        return error
+    raise AssertionError(f"{obj.key!r} computed successfully under {scheduler!r}")
+
+
+def test_every_corpus_entry_has_a_result_assertion() -> None:
+    """No entry escapes the result evidence: every flag is backed by a table.
+
+    ``test_flag_exclusions_are_documented`` proves each ``False`` flag carries a
+    written reason; this proves each entry without a golden ``result_repr`` still
+    has something asserted about its result. A new ``computable=False`` entry
+    fails here until it is added to one of the two tables.
+
+    The contract of ``_result_signature`` is locked here as well, since the
+    strength of every function-valued comparison rests on it: a callable collapses
+    to its module-qualified name, a container keeps its kind and maps its elements
+    recursively, and every other value is returned untouched so it is still
+    compared by value.
+    """
+    without_golden_result = {entry.name for entry in CORPUS if not entry.computable}
+    covered = set(_FUNCTION_VALUED_RESULTS) | set(_NON_RUNNABLE_RESULTS)
+    assert covered == without_golden_result, (
+        "every entry without a golden result_repr must be covered by "
+        "_FUNCTION_VALUED_RESULTS or _NON_RUNNABLE_RESULTS: "
+        f"uncovered={sorted(without_golden_result - covered)}, "
+        f"stale={sorted(covered - without_golden_result)}"
+    )
+    assert not set(_FUNCTION_VALUED_RESULTS) & set(_NON_RUNNABLE_RESULTS)
+
+    assert _result_signature(inc) == "dask.utils_test.inc"
+    assert _result_signature([(inc,), 3]) == [("dask.utils_test.inc",), 3]
+    assert _result_signature((1, "s", None)) == (1, "s", None)
+
+
+def test_results_match_across_schedulers() -> None:
+    """The whole corpus behaves identically under ``sync`` and ``threads``.
+
+    Three result shapes, all asserted and none skipped: entries with a golden
+    ``result_repr`` are compared value for value; the two whose value is a
+    function object are compared by module-qualified name, because only their
+    ``repr`` is unstable; and the deliberately non-runnable entries are
+    compared by the exception they raise, which for them *is* the result. The
+    synchronous leg of the first group goes through ``canonical_result`` so that
+    this test and the A/B harness share one definition of "the result of an
+    expression".
     """
     entries = [entry for entry in CORPUS if entry.computable]
     objects = [entry.build() for entry in entries]
@@ -3935,29 +5680,91 @@ def test_results_match_across_schedulers() -> None:
     for entry, sync_value, threaded_value in zip(entries, synchronous, threaded):
         assert sync_value == threaded_value, f"{entry.name} differs across schedulers"
 
+    for name, signature in _FUNCTION_VALUED_RESULTS.items():
+        obj = _by_name(name).build()
+        (sync_value,) = canonical_result([obj])
+        (threaded_value,) = dask.compute(obj, scheduler="threads")
+        assert _result_signature(sync_value) == signature, name
+        assert _result_signature(threaded_value) == signature, name
+        # Function objects compare by identity, so the plain equality the rest of
+        # the corpus gets applies to these values too.
+        assert sync_value == threaded_value, f"{name} differs across schedulers"
+
+    for name, (exception_type, message) in _NON_RUNNABLE_RESULTS.items():
+        obj = _by_name(name).build()
+        synchronous_error = _computed_exception(obj, "sync")
+        threaded_error = _computed_exception(obj, "threads")
+        assert type(synchronous_error) is exception_type, name
+        assert type(threaded_error) is exception_type, name
+        assert str(synchronous_error).startswith(message), name
+        assert str(threaded_error) == str(
+            synchronous_error
+        ), f"{name} fails differently across schedulers"
+
+
+def _assert_round_tripped_result(entry: _Expr, obj: Any, restored: Any) -> None:
+    """Assert an unpickled object produces the same result as the original.
+
+    The three result shapes of the corpus are handled in the same order as in
+    ``test_results_match_across_schedulers``, so an entry is covered by whichever
+    of them applies rather than by being skipped.
+
+    Args:
+        entry: The corpus entry being round-tripped.
+        obj: The object as built.
+        restored: The same object after a pickle round trip.
+
+    Raises:
+        AssertionError: if the restored object's result -- its value, its function
+            identity or the exception it raises -- differs from the original's.
+    """
+    if entry.computable:
+        assert (
+            repr(canonical_result([restored])[0]) == GOLDEN[entry.name]["result_repr"]
+        ), entry.name
+        return
+    if entry.name in _FUNCTION_VALUED_RESULTS:
+        (value,) = canonical_result([restored])
+        assert (
+            _result_signature(value) == _FUNCTION_VALUED_RESULTS[entry.name]
+        ), entry.name
+        return
+    exception_type, message = _NON_RUNNABLE_RESULTS[entry.name]
+    original_error = _computed_exception(obj, "sync")
+    restored_error = _computed_exception(restored, "sync")
+    assert type(original_error) is exception_type, entry.name
+    assert type(restored_error) is exception_type, entry.name
+    assert str(restored_error).startswith(message), entry.name
+    assert str(restored_error) == str(original_error), entry.name
+
 
 def test_objects_and_graphs_round_trip_through_pickle() -> None:
-    """Every eligible object and its graph survive ``pickle`` at protocol 5.
+    """Every picklable object and its graph survive ``pickle`` at protocol 5.
 
     This is the serializability property non-synchronous schedulers depend on:
     the wrapped values, the tasks and the graph container all have to cross a
     process boundary. Corpus callables and types are module-level, so they pickle
     by reference.
 
-    Results are compared against the golden ``result_repr`` rather than with
-    ``==`` because one entry's computed value contains a ``Delayed`` -- with
+    Eligibility is picklability and nothing else. Whether an entry has a stable
+    golden ``result_repr`` says nothing about whether it survives ``pickle``, so
+    the entries without one -- two that compute to a function object, four
+    that are deliberately not runnable -- are round-tripped here like every other
+    entry, and their results are asserted by ``_assert_round_tripped_result``
+    through the property that is stable about them. The one entry that genuinely
+    cannot be pickled is a ``types.MappingProxyType`` graph, which ``pickle``
+    refuses outright; that exclusion is justified by name in
+    ``_EXCLUSION_REASONS``, which ``test_flag_exclusions_are_documented`` keeps
+    honest.
+
+    Computable results are compared against the golden ``result_repr`` rather than
+    with ``==`` because one entry's computed value contains a ``Delayed`` -- with
     ``traverse=False`` the object is quoted, not traversed -- and
     ``Delayed.__eq__`` is a lazy operator that builds a new ``Delayed`` instead of
     returning a boolean.
-
-    Entries excluded by a flag are skipped by name, and every skip is justified in
-    ``_EXCLUSION_REASONS``; ``test_flag_exclusions_are_documented`` keeps that
-    table honest.
     """
-    eligible = [entry for entry in CORPUS if entry.computable and entry.picklable]
-    excluded = {
-        entry.name for entry in CORPUS if not (entry.computable and entry.picklable)
-    }
+    eligible = [entry for entry in CORPUS if entry.picklable]
+    excluded = {entry.name for entry in CORPUS if not entry.picklable}
     assert len(eligible) >= 40, "the pickle round trip must cover the corpus floor"
     assert excluded <= set(_EXCLUSION_REASONS), (
         "an entry skipped by the pickle round trip must carry a reason: "
@@ -3971,13 +5778,21 @@ def test_objects_and_graphs_round_trip_through_pickle() -> None:
         restored = pickle.loads(pickle.dumps(obj, protocol=5))
         restored_graph = pickle.loads(pickle.dumps(graph, protocol=5))
 
+        assert type(restored) is type(obj), entry.name
         assert restored.key == obj.key, entry.name
         assert list(restored.__dask_keys__()) == list(obj.__dask_keys__()), entry.name
         assert tuple(restored.__dask_layers__()) == tuple(obj.__dask_layers__())
-        assert list(restored_graph.layers) == list(graph.layers), entry.name
-        assert list(restored_graph.dependencies) == list(graph.dependencies), entry.name
+        assert type(restored_graph) is type(graph), entry.name
+        if isinstance(graph, HighLevelGraph):
+            assert list(restored_graph.layers) == list(graph.layers), entry.name
+            assert list(restored_graph.dependencies) == list(
+                graph.dependencies
+            ), entry.name
+        else:
+            # ``finalize()`` hands back an expression (``HLGFinalizeCompute``)
+            # rather than a layer container, and an expression's identity is its
+            # ``_name``; there is no ``layers`` mapping to compare.
+            assert restored_graph._name == graph._name, entry.name
         if entry.canonical:
             assert canonical_graph(restored) == GOLDEN[entry.name]["graph"], entry.name
-        assert (
-            repr(canonical_result([restored])[0]) == GOLDEN[entry.name]["result_repr"]
-        ), entry.name
+        _assert_round_tripped_result(entry, obj, restored)
