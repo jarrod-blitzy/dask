@@ -45,7 +45,8 @@ Artefacts:
     and ``max_observed_blocks`` are supporting evidence that is never called a
     peak.
 
-Exit codes:
+Exit codes of the run itself; ``argparse`` rejects a malformed command line
+before the run starts, with its conventional status 2:
     ``0`` -- every gate item held. ``1`` -- the gate failed; the printed checklist
     names the item. ``2`` -- an equivalence mismatch, with no artefact written.
     ``3`` -- artefacts were requested inside a dirty working tree, so the runner

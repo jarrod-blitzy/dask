@@ -2314,17 +2314,379 @@ def _baseline_arm() -> dict[str, Any]:
     }
 
 
-def _rejected_optimizations(flat_loop_median_ns: float | None) -> dict[str, Any]:
-    """Re-measure the cost of the one probe the refactor deliberately kept.
+#: The standing record of the golden-capture ordering deviation. AAP 0.5.1 has the
+#: characterisation test's ``GOLDEN`` literal captured from the pre-refactor module
+#: *before* the first edit to ``dask/delayed.py``; it was rewritten after that edit
+#: instead. The deviation travels in the artefacts rather than being papered over,
+#: together with the re-derivation that establishes the property the ordering
+#: requirement exists to guarantee -- that the golden encodes pre-refactor
+#: behaviour and was not bent to fit the candidate. Read-only, like
+#: ``_PEAK_BLOCK_COUNT_CONFLICT``: the environment block is assembled once and
+#: serialised, never mutated, so these fields are published as they stand here.
+#: ``environment()`` publishes them together with a ``verified_block`` sub-record
+#: that ``_golden_block`` reads out of the measured tree, which is what ties the
+#: prose below to a particular golden literal.
+_GOLDEN_CAPTURE_ORDERING: dict[str, Any] = {
+    "requirement": (
+        "AAP 0.5.1: the GOLDEN fixture of dask/tests/test_delayed_equivalence.py "
+        "is captured from the pre-refactor module before the first edit to "
+        "dask/delayed.py, and any later edit to the literal -- other than adding "
+        "an expression with its own captured values before the refactor begins -- "
+        "fails the run."
+    ),
+    "deviation": (
+        "the block was rewritten after the production edit. The marker block "
+        "hashes to 392634dd... at commits 1cbdf00d3 and 76a0d1ca3 and to "
+        "2667295b... from c771b566e onward: 9 entries added, 81 gained a "
+        "stable_graph field, and 3 -- attr_v, attr_of_attr, attr_items_getitem -- "
+        "had graph.layers rewritten by the canonicaliser's cross-layer-dependency "
+        "correction."
+    ),
+    "remedy": (
+        "accepted on the strength of the re-derivation recorded here, and the "
+        "golden is never regenerated again. The alternative -- re-capturing the "
+        "golden before the production edit in a corrected history -- needs the "
+        "history rewrite that the commit_protocol record below reports as "
+        "unavailable on a published branch."
+    ),
+    "verification": (
+        "88 of the 90 GOLDEN entries re-derive byte-identically under the frozen "
+        "baseline arm, with 0 errors. The 2 that differ, named in "
+        "differing_entries, are the pickle-by-reference constructs AAP 0.4.1 "
+        "documents as inherently arm-dependent: their tokens embed the arm's own "
+        "module path, so the two arms necessarily produce different deterministic "
+        "tokens even on identical code."
+    ),
+    "verification_method": (
+        "benchmarks/delayed_ab/baseline_delayed.py installed as "
+        "sys.modules['dask.delayed'] before dask.tests.test_delayed_equivalence "
+        "is imported, then every corpus entry rebuilt under that test module's "
+        "own _pinned() hasher and config pins and compared field by field against "
+        "GOLDEN[entry.name]."
+    ),
+    "entries_total": 90,
+    "entries_reproduced": 88,
+    "entries_differing": 2,
+    "differing_entries": ("arg_list_iterator_with_delayed", "op_reflected_add"),
+    "errors": 0,
+    "conclusion": (
+        "no expectation was bent to fit the candidate: the golden encodes "
+        "pre-refactor behaviour, and the 3 rewritten graph values are the "
+        "canonicaliser's cross-layer-dependency correction rather than a change "
+        "in the module under test."
+    ),
+}
 
-    ``delayed()`` evaluates ``is_dask_collection(obj) or traverse`` in that order.
-    Reordering it would skip the probe whenever ``traverse`` is true, but for a
-    user object that exposes the collection protocol the first probe is
-    observable -- it reads ``x.expr`` / calls ``__dask_graph__()`` before
-    ``unpack_collections`` does -- so reordering could change warning counts,
-    mutations or exceptions in user wrappers. The optimization is therefore not
-    taken, and this function measures what keeping the probe costs so that the
-    artefacts carry that figure.
+
+#: The test module carrying the golden literal, the two marker lines that delimit
+#: it, and the digest the re-derivation above verified. Stated repository-relative
+#: so that no host path can reach the artefacts. The digest is the one figure of
+#: the F01 record that is checked rather than asserted: ``_golden_block`` reads the
+#: block out of the measured tree and reports whether it still hashes to this
+#: value, so a golden regenerated after the verification is visible in the
+#: artefacts instead of silently inheriting its credibility.
+_GOLDEN_SOURCE_PATH = "dask/tests/test_delayed_equivalence.py"
+_GOLDEN_BEGIN_MARKER = (
+    "# --- BEGIN GOLDEN (generated by write_golden(); do not edit by hand) ---"
+)
+_GOLDEN_END_MARKER = "# --- END GOLDEN ---"
+_GOLDEN_BLOCK_SHA256 = (
+    "2667295ba3342e95f73879309ec98ea3a8023350a73cda3bc884deceb359d083"
+)
+
+#: Largest characterisation-test module this reader accepts, bounding the read the
+#: way ``_MAX_CAPTURE_BYTES`` bounds arm A's. The module is a few hundred kilobytes,
+#: almost all of it the golden literal, so the limit leaves ample room while still
+#: refusing an implausible file rather than reading it.
+_MAX_GOLDEN_SOURCE_BYTES = 4_194_304
+
+#: How the digest above is defined, and the shell command that re-derives it.
+#: Published with the figure so that a reader can check it without reading this
+#: module.
+_GOLDEN_DIGEST_DEFINITION = (
+    "sha256 over the block from the begin-marker line through the end-marker line "
+    "inclusive, with the trailing newline stripped. The two markers, not the line "
+    "numbers, define the object: the numbers shift with any edit above the block "
+    "while the digest does not."
+)
+_GOLDEN_DIGEST_COMMAND = (
+    "sed -n '/^# --- BEGIN GOLDEN/,/^# --- END GOLDEN ---$/p' "
+    'dask/tests/test_delayed_equivalence.py | python -c "import '
+    "hashlib,sys;print(hashlib.sha256(sys.stdin.buffer.read()"
+    ".rstrip(b'\\n')).hexdigest())\""
+)
+
+
+def _golden_block() -> dict[str, Any]:
+    """Locate and digest the golden literal in the tree being measured.
+
+    The F01 record states a verification that was performed once, against one
+    particular golden block. This function pins that statement to an object: it
+    finds the block by its markers in the measured tree, digests it, and reports
+    whether the digest is still the one the re-derivation ran against. The line
+    numbers it returns are therefore facts about the commit the artefacts name
+    rather than numbers that go stale when anything above the block moves.
+
+    A read that fails degrades rather than raising: unlike arm A -- the
+    denominator of every ratio, whose provenance decides whether the run means
+    anything -- this is a record about a test fixture, and a run that cannot read
+    it still produced valid measurements. The failure is recorded in ``note``
+    with ``sha256`` left null, which is not a digest that matched.
+
+    Returns:
+        The ``verified_block`` sub-record of ``environment.golden_capture_ordering``:
+        the repository-relative path, both markers, the block's line span and
+        length, its digest with the expected one and whether they agree, the
+        digest's definition, the command that re-derives it, and a note naming
+        what went wrong when the block could not be read.
+    """
+    record: dict[str, Any] = {
+        "file": _GOLDEN_SOURCE_PATH,
+        "begin_marker": _GOLDEN_BEGIN_MARKER,
+        "end_marker": _GOLDEN_END_MARKER,
+        "first_line": None,
+        "last_line": None,
+        "lines": None,
+        "sha256": None,
+        "expected_sha256": _GOLDEN_BLOCK_SHA256,
+        "sha256_matches_expected": False,
+        "digest_definition": _GOLDEN_DIGEST_DEFINITION,
+        "digest_command": _GOLDEN_DIGEST_COMMAND,
+        "note": None,
+    }
+    source = _repository_root() / _GOLDEN_SOURCE_PATH
+    try:
+        size = source.stat().st_size
+        if size > _MAX_GOLDEN_SOURCE_BYTES:
+            record["note"] = (
+                f"{_GOLDEN_SOURCE_PATH} is {size} bytes, above the "
+                f"{_MAX_GOLDEN_SOURCE_BYTES}-byte limit this reader accepts, so "
+                "the block was not digested"
+            )
+            return record
+        text = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        record["note"] = (
+            f"{_GOLDEN_SOURCE_PATH} could not be read "
+            f"({type(exc).__name__}: {exc.strerror or exc}), so the block was "
+            "not digested"
+        )
+        return record
+
+    # Markers are matched on the stripped line, exactly as the test module's own
+    # locator does, so a line that merely contains the marker text is not one.
+    lines = text.splitlines(keepends=True)
+    begin = end = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == _GOLDEN_BEGIN_MARKER:
+            begin = index
+        elif stripped == _GOLDEN_END_MARKER:
+            end = index
+    if begin is None or end is None or end < begin:
+        record["note"] = (
+            f"the golden markers were not found in order in {_GOLDEN_SOURCE_PATH}, "
+            "so the block was not digested"
+        )
+        return record
+
+    block = "".join(lines[begin : end + 1]).rstrip("\n")
+    digest = hashlib.sha256(block.encode("utf-8")).hexdigest()
+    record["first_line"] = begin + 1
+    record["last_line"] = end + 1
+    record["lines"] = end - begin + 1
+    record["sha256"] = digest
+    record["sha256_matches_expected"] = digest == _GOLDEN_BLOCK_SHA256
+    if not record["sha256_matches_expected"]:
+        record["note"] = (
+            "the block no longer hashes to the digest the re-derivation "
+            f"verified ({_GOLDEN_BLOCK_SHA256}), so the verification recorded "
+            "here was performed against a different golden literal"
+        )
+    return record
+
+
+#: The standing record of the commit-protocol deviation. AAP 0.7.4 prescribes one
+#: source commit followed by one artefact-only commit, and the branch carries many
+#: more, with this artefact pair first added inside a source commit. A history
+#: rewrite is not available to a published branch, so what is recorded is the
+#: property the protocol exists to produce, stated as something a reader checks
+#: against this document's own ``arms.candidate`` fields rather than as a promise:
+#: the pair comes from one run on a clean source commit, and the SHA it records
+#: identifies exactly the ``dask/delayed.py`` that was measured.
+#:
+#: Every count here is scoped to a named commit, and the counts that depend on the
+#: tree being measured are read from it by ``_commit_protocol`` rather than stated:
+#: a figure quoted against ``HEAD`` goes stale the moment another commit lands,
+#: which is the one thing a deviation record must not do.
+_COMMIT_PROTOCOL: dict[str, Any] = {
+    "requirement": (
+        "AAP 0.7.4: one source commit carrying dask/delayed.py, both test files "
+        "and the six harness modules, then one artefact-only second commit "
+        "carrying benchmarks/delayed_ab/results/baseline_vs_candidate.json and "
+        "benchmarks/delayed_ab/results/report.md."
+    ),
+    "deviation": (
+        "the branch carried nine commits since its base c9d1df34c at the tip "
+        "a62c94b47 the deviation was raised against, against the two AAP 0.7.4 "
+        "prescribes, and the two result files were not confined to an "
+        "artefact-only commit: they were first added inside the source commit "
+        "76a0d1ca3 and then modified in 3e4f49ef2, c771b566e and a62c94b47. "
+        "Every remediation since has kept the protocol -- one source commit, "
+        "then the runner executed from that clean commit, then an artefact-only "
+        "commit -- so the count has grown by two per round while the property "
+        "below has held. commits_since_base_at_measurement carries the count as "
+        "it stood in the tree these figures were measured in, and the "
+        "artefact-only commit that adds this pair makes it one more."
+    ),
+    "base_commit": "c9d1df34ccba182ddf43c2dbe4315c4d9c8c44e1",
+    "reviewed_tip": "a62c94b47",
+    "commits_at_reviewed_tip": 9,
+    "commits_prescribed": 2,
+    "artefacts_added_in": "76a0d1ca3",
+    "artefacts_modified_in_through_reviewed_tip": (
+        "3e4f49ef2",
+        "c771b566e",
+        "a62c94b47",
+    ),
+    "deviation_method": (
+        "git rev-list --count c9d1df34c..a62c94b47 for the count at the reviewed "
+        "tip, and git log --name-status c9d1df34c..a62c94b47 -- "
+        "benchmarks/delayed_ab/results/ for the add-and-modify sequence. Both are "
+        "pinned to that commit rather than to HEAD, so neither answer moves."
+    ),
+    "rewrite": (
+        "not performed -- the branch is published and the clone contract forbids "
+        "rebase, reset and force-push, so the recorded history cannot be "
+        "collapsed into the prescribed two commits after the fact."
+    ),
+    "essential_property": (
+        "the artefacts come from one execution on a clean source commit and are "
+        "committed alone in an artefact-only commit, so the recorded SHA "
+        "identifies exactly the dask/delayed.py that was measured rather than "
+        "the commit that adds the artefacts -- which is the whole of what the "
+        "two-commit protocol exists to produce."
+    ),
+    "property_check": (
+        "three checks against this document, none of them a promise: (1) "
+        "environment.arms.candidate.dirty is false, so no source file differed "
+        "from its commit when the measurements were taken; (2) "
+        "environment.arms.candidate.git_head names that commit, and sha256 of "
+        "dask/delayed.py at it equals "
+        "environment.arms.candidate.delayed_py_sha256; (3) the commit that adds "
+        "these two files is a descendant of it and changes no source file. The "
+        "commands are: git cat-file -e <git_head>; git show "
+        "<git_head>:dask/delayed.py | sha256sum; git log --name-status -1 -- "
+        "benchmarks/delayed_ab/results/baseline_vs_candidate.json"
+    ),
+    "enforced_by": (
+        "the runner refuses to write into benchmarks/delayed_ab/results/ while "
+        "git status --porcelain --untracked-files=all is non-empty, evaluated "
+        "before any output file is created, so a committed pair cannot describe "
+        "an uncommitted tree."
+    ),
+}
+
+
+def _commit_protocol() -> dict[str, Any]:
+    """Publish the commit-protocol record, with its live counts read from the tree.
+
+    The static fields state the deviation as it was raised, pinned to the commit
+    it was raised against. The two fields this function adds are properties of
+    the tree being measured, so they are read here rather than stated: the number
+    of commits the branch carries since its base, and the commits that have
+    touched the result pair. A record whose own verification command disagrees
+    with its figure is worse than no record, and a figure quoted against ``HEAD``
+    is guaranteed to disagree as soon as the next commit lands.
+
+    Returns:
+        The record for ``environment.commit_protocol``: every static field of
+        ``_COMMIT_PROTOCOL`` plus ``commits_since_base_at_measurement``,
+        ``artefact_commits_at_measurement``, the commands behind them, and a note
+        naming what degraded when git could not answer.
+    """
+    record = dict(_COMMIT_PROTOCOL)
+    root = _repository_root()
+    notes: list[str] = []
+    span = f"{_BASELINE_SHA}..HEAD"
+
+    count: int | None = None
+    counted, note = _git(root, "rev-list", "--count", span)
+    if note is not None:
+        notes.append(note)
+    if counted is not None:
+        try:
+            count = int(counted.strip())
+        except ValueError:
+            notes.append(
+                f"`git rev-list --count {span}` answered "
+                f"{counted.strip()!r}, which is not a count"
+            )
+    if count is None:
+        notes.append(
+            "the number of commits since the base could not be read, so it is "
+            "recorded as unknown rather than as the figure of an earlier run"
+        )
+
+    artefacts: tuple[str, ...] | None = None
+    log, note = _git(
+        root,
+        "log",
+        "--format=%h",
+        span,
+        "--",
+        f"{_DEFAULT_OUTPUT}/",
+    )
+    if note is not None:
+        notes.append(note)
+    if log is not None:
+        # Newest first, as git reports it; every entry is a short SHA of a commit
+        # that touched the result pair up to and including the measured commit.
+        artefacts = tuple(line.strip() for line in log.splitlines() if line.strip())
+
+    record["commits_since_base_at_measurement"] = count
+    record["commits_since_base_method"] = (
+        f"git rev-list --count {span}, run in the measured tree, where HEAD is "
+        "the source commit these figures describe"
+    )
+    record["artefact_commits_at_measurement"] = artefacts
+    record["artefact_commits_method"] = (
+        f"git log --format=%h {span} -- {_DEFAULT_OUTPUT}/, newest first; the "
+        "artefact-only commit that adds this pair is the next one after the "
+        "measured commit and is therefore not in the list"
+    )
+    record["note"] = " | ".join(notes) if notes else None
+    return record
+
+
+#: Constructions performed per iteration by the ``nested_containers`` case, whose
+#: loop count is frozen in ``cases.py`` as a private constant and is therefore
+#: restated -- not imported -- here, exactly as ``_FLAT_LOOP_CONSTRUCTIONS`` is, so
+#: that the per-iteration cost of the rejected container shortcut can be related
+#: to the whole timed region.
+_NESTED_CONTAINERS_ITERATIONS = 200
+
+
+def _rejected_optimizations(flat_loop_median_ns: float | None) -> dict[str, Any]:
+    """Record both optimizations the refactor considered and did not take.
+
+    ``traverse_probe_order``: ``delayed()`` evaluates ``is_dask_collection(obj) or
+    traverse`` in that order. Reordering it would skip the probe whenever
+    ``traverse`` is true, but for a user object that exposes the collection
+    protocol the first probe is observable -- it reads ``x.expr`` / calls
+    ``__dask_graph__()`` before ``unpack_collections`` does -- so reordering could
+    change warning counts, mutations or exceptions in user wrappers. The
+    optimization is therefore not taken, and this function measures what keeping
+    the probe costs so that the artefacts carry that figure.
+
+    ``verbatim_container_shortcut``: ``unpack_collections``' sequence branch used
+    to return the container itself, before constructing ``List(*args)``, whenever
+    the recursion had changed nothing, no collection had been found and the
+    container did not hold exactly one element. It is not taken because AAP 0.6.1
+    D2 does not enumerate it and D2's equivalence clause requires the
+    ``List(*args)`` call form for every container, so its cost is carried as the
+    figures measured for it rather than re-measured here: the shortcut is not in
+    the code any more, so there is nothing in this process to time.
 
     Args:
         flat_loop_median_ns: The candidate's median ``flat_loop`` region, used to
@@ -2332,7 +2694,10 @@ def _rejected_optimizations(flat_loop_median_ns: float | None) -> dict[str, Any]
             derived fields null.
 
     Returns:
-        The record for ``environment.rejected_optimizations``.
+        Both records for ``environment.rejected_optimizations``, keyed by the name
+        of the optimization: the live micro-benchmark of the kept probe and the
+        stated measurement of the container shortcut, each figure beside the
+        method that produced it.
     """
     elapsed = timeit.timeit(
         "is_dask_collection(target)",
@@ -2364,7 +2729,130 @@ def _rejected_optimizations(flat_loop_median_ns: float | None) -> dict[str, Any]
                 f"number={_MICROBENCH_ITERATIONS}) against a plain module-level "
                 "function, in this process and this environment"
             ),
-        }
+        },
+        # The second not-taken optimization. Its figures were measured while the
+        # shortcut still existed in the source, so they are stated here with the
+        # method that produced each one rather than re-derived in this process:
+        # the code the numbers describe is no longer present to time.
+        "verbatim_container_shortcut": {
+            "decision": "not taken",
+            "site": (
+                "dask/delayed.py -- unpack_collections, the list/tuple/set "
+                "branch, ahead of `args = List(*args)`"
+            ),
+            "optimization": (
+                "the branch tracked a `verbatim` flag across the recursion and "
+                "returned `expr, ()` -- the container object itself -- whenever "
+                "every element came back from the recursion as the object that "
+                "went in and was itself no TaskRef or GraphNode, no collection "
+                "had been found, and the container did not hold exactly one "
+                "element; for such a container `List(*args)` was never "
+                "constructed"
+            ),
+            "reason": (
+                "AAP 0.6.1 D2 does not enumerate it, and D2's equivalence clause "
+                "requires the `List(*args)` call form for every container so that "
+                "NestedContainer.__init__'s single-list unwrapping is exercised "
+                "identically. Output equivalence itself held -- the `len(args) != "
+                "1` exclusion left every container that unwrapping could reach on "
+                "the constructing path -- but the mechanics were beyond the frozen "
+                "plan, and Rule 1 forbids mechanics beyond it"
+            ),
+            "skipped_constructions_per_iteration": 9,
+            "ns_per_skipped_construction": 1370.0,
+            "ns_per_iteration": 12300.0,
+            "region_iterations": _NESTED_CONTAINERS_ITERATIONS,
+            "region_ms_with_shortcut": 141.3,
+            "region_ms_without_shortcut": 144.24,
+            "region_ms_baseline_arm": 176.89,
+            "region_delta_ms": 2.94,
+            "ratio_with_shortcut": 1.2576,
+            "ratio_with_shortcut_source": (
+                "benchmarks/delayed_ab/results/baseline_vs_candidate.json as "
+                "committed at a62c94b47: cases.nested_containers.ratio_median "
+                "over 31 measured rounds"
+            ),
+            "ratio_without_shortcut_field": (
+                "cases.nested_containers.ratio_median of this document, which "
+                "measures the code with the shortcut removed"
+            ),
+            "ratio_threshold": _RATIO_THRESHOLD,
+            "consequence": (
+                "the AAP 0.4.6 gate item `nested_containers` paired ratio median "
+                f">= {_RATIO_THRESHOLD}, and therefore the overall verdict, is "
+                "what not taking this optimization costs: the figures above are "
+                "the whole of the difference. dask/tests/test_delayed_ab_gate.py "
+                "asserts that verdict, so the opt-in gate test fails for the "
+                "same reason -- correctly, since it encodes the threshold this "
+                "run measures against. It is skipped unless DASK_DELAYED_AB=1, "
+                "so the default test suite is unaffected"
+            ),
+            # Why the shortfall was not simply made up elsewhere. The share of
+            # the region that is frozen is what bounds the answer, so it is
+            # published as figures rather than as a claim that the search was
+            # thorough.
+            "recovery_search": (
+                "the shortfall was not recovered because no D1-D8-sanctioned "
+                "mechanic reaches it. Of the 649 us the nested_containers "
+                "argument traversal costs per iteration, 549 us is work this "
+                "module only calls: 410 us inside _finalize_args_collections, "
+                "whose body AAP 0.2.1 freezes, and 139 us in the nine "
+                "per-iteration Delayed-branch conversions through "
+                "collections_to_expr at 15.5 us each, a branch D2 leaves "
+                "unchanged. Every microsecond of the remaining 100 us is "
+                "mechanics D1-D8 prescribe line by line -- the identity fast "
+                "path, the single loop, the id-dedupe, the List/Dict/Task "
+                "constructions the call forms mandate, the two-pass D4 guard, "
+                "the per-call config read and uuid4, and the slot writes 0.6.1 "
+                "explicitly keeps -- so even reducing all of it to nothing would "
+                "leave the case near 1.45 rather than unbounded, and the "
+                "threshold needs 11 us of it. Three D2-compatible variants were "
+                "measured and none adopted: fusing the id-dedupe with the tuple "
+                "build, binding is_dask_collection as a local name, and binding "
+                "the recursive call to a local, together worth at most 0.35 us "
+                "per iteration against the 11 us needed"
+            ),
+            "traversal_us_per_iteration": 649.0,
+            "frozen_us_per_iteration": 549.0,
+            "finalize_us_per_iteration": 410.0,
+            "delayed_ref_conversions_per_iteration": 9,
+            "delayed_ref_conversion_us": 15.5,
+            "micro_variant_ceiling_us_per_iteration": 0.35,
+            "deficit_us_per_iteration": 11.0,
+            "deficit_method": (
+                "measured at a paired ratio of 1.225; derive it for this "
+                "document's own figures as (candidate median ns - baseline "
+                f"median ns / {_RATIO_THRESHOLD}) / "
+                f"{_NESTED_CONTAINERS_ITERATIONS} iterations, from "
+                "cases.nested_containers.stats"
+            ),
+            "method_recovery_search": (
+                "cProfile call counts, instrumented wrappers around "
+                "_finalize_args_collections, _graph_from_collections, "
+                "collections_to_expr, List, Dict, Task, tokenize and funcname, "
+                "and timeit over unpack_collections on the case's exact argument "
+                "shape, all in this clone and this environment"
+            ),
+            "closure": (
+                "either an amendment of AAP 0.6.1 D2 by its owner, restoring the "
+                "shortcut, or acceptance of the measured ratio this document "
+                "reports for nested_containers"
+            ),
+            "method_per_construction": (
+                "timeit in this clone and this environment over the List(*args) "
+                "construction the shortcut skipped, for the literal-only "
+                "containers the nested_containers case builds per iteration"
+            ),
+            "method_region": (
+                "minimum of 15 timed nested_containers build regions per variant "
+                "in this clone and this environment: the candidate with the "
+                "shortcut, the candidate without it, and the frozen baseline arm"
+            ),
+            "method_ratio": (
+                "the harness's own paired ratio median -- (A1+A2)/(B1+B2) per "
+                "round, median over the measured rounds"
+            ),
+        },
     }
 
 
@@ -2386,8 +2874,13 @@ def environment(
 
     Returns:
         A JSON-serialisable description of the interpreter, the machine, the
-        resolved dependency set, both arms' provenance, the cost record of the
-        rejected probe reordering and the standing peak-block-count conflict.
+        resolved dependency set, both arms' provenance, the cost record of both
+        rejected optimizations, the standing peak-block-count conflict and the
+        two accepted evidence deviations -- ``golden_capture_ordering``, the
+        golden block's post-refactor rewrite with the baseline-arm re-derivation
+        that was accepted in its place, and ``commit_protocol``, the nine-commit
+        history with the property a reader checks against ``arms.candidate``
+        instead.
         Every recorded fact is reachable under its own direct key -- the
         free-threading flags, the five key package versions and both arms'
         provenance included -- so a reader never has to know the grouping first;
@@ -2481,6 +2974,19 @@ def environment(
         "generated_at": _utc_now_iso(),
         "rejected_optimizations": _rejected_optimizations(flat_loop_median_ns),
         "peak_block_count_conflict": _PEAK_BLOCK_COUNT_CONFLICT,
+        # The two accepted evidence deviations, each under its own direct key
+        # beside the conflict above: a requirement that was not met literally,
+        # what was verified instead, and how a reader re-derives that
+        # verification from this repository rather than from a promise.
+        # The static half of the F01 record carries the requirement, the
+        # deviation and the re-derivation that was accepted in its place; the
+        # ``verified_block`` half is read out of the measured tree here, so the
+        # record names the golden it actually describes.
+        "golden_capture_ordering": {
+            **_GOLDEN_CAPTURE_ORDERING,
+            "verified_block": _golden_block(),
+        },
+        "commit_protocol": _commit_protocol(),
         "notes": [_sanitise_path(note, state.root) for note in state.notes],
     }
 
@@ -3592,7 +4098,36 @@ def write_report(path: pathlib.Path, payload: dict[str, Any]) -> None:
     baseline_arm = env["arms"][_BASELINE]
     candidate_arm = env["arms"][_CANDIDATE]
     probe = env["rejected_optimizations"]["traverse_probe_order"]
+    golden = env["golden_capture_ordering"]
+    golden_block = golden["verified_block"]
+    protocol = env["commit_protocol"]
+    shortcut = env["rejected_optimizations"]["verbatim_container_shortcut"]
     packages = env["packages"]
+    # The block is read out of the measured tree, so the line rendering it has two
+    # forms: the figures when the read succeeded, and what went wrong when it did
+    # not. A null digest is never presented as one that matched.
+    if golden_block["sha256"] is None:
+        golden_block_line = (
+            f"- Golden block verified: the block in {golden_block['file']} could "
+            f"not be digested for this record -- {golden_block['note']}. The "
+            f"digest the re-derivation ran against is "
+            f"{golden_block['expected_sha256']}; re-derive it with: "
+            f"`{golden_block['digest_command']}`"
+        )
+    else:
+        golden_block_line = (
+            f"- Golden block verified: {golden_block['file']}, the "
+            f"{golden_block['lines']} lines from "
+            f"`{golden_block['begin_marker']}` through "
+            f"`{golden_block['end_marker']}` inclusive (lines "
+            f"{golden_block['first_line']}-{golden_block['last_line']} of the "
+            f"measured commit), sha256 {golden_block['sha256']}, which matches "
+            "the digest the re-derivation ran against "
+            f"({golden_block['expected_sha256']}): "
+            f"{golden_block['sha256_matches_expected']}. "
+            f"{golden_block['digest_definition']} Re-derive it with: "
+            f"`{golden_block['digest_command']}`"
+        )
     lines: list[str] = [
         "# dask.delayed A/B performance report",
         "",
@@ -3642,6 +4177,47 @@ def write_report(path: pathlib.Path, payload: dict[str, Any]) -> None:
         f"({_format_share(probe['share_of_flat_loop_construction'])}), by "
         f"{probe['method']}.",
         f"- Peak block count: {env['peak_block_count_conflict']}",
+        f"- Golden capture ordering: {golden['requirement']} Deviation: "
+        f"{golden['deviation']} Remedy: {golden['remedy']} Verified instead: "
+        f"{golden['verification']} Method: {golden['verification_method']} "
+        f"Conclusion: {golden['conclusion']}",
+        golden_block_line,
+        f"- Commit protocol: {protocol['requirement']} Deviation: "
+        f"{protocol['deviation']} ({protocol['commits_at_reviewed_tip']} commits "
+        f"since {protocol['base_commit']} at {protocol['reviewed_tip']}, against "
+        f"the {protocol['commits_prescribed']} prescribed, by "
+        f"{protocol['deviation_method']}; "
+        f"{_format_count_or_unknown(protocol['commits_since_base_at_measurement'])} "
+        f"at the commit measured here, by {protocol['commits_since_base_method']}; "
+        "commits that have touched the pair up to it: "
+        f"{_format_commit_list(protocol['artefact_commits_at_measurement'])}, by "
+        f"{protocol['artefact_commits_method']}) Rewrite: {protocol['rewrite']} "
+        f"Property re-established instead: {protocol['essential_property']} "
+        f"How to check it: {protocol['property_check']}. "
+        f"Enforced by: {protocol['enforced_by']}"
+        + (f" Degraded: {protocol['note']}" if protocol["note"] else ""),
+        f"- Rejected optimization on record: the container shortcut was "
+        f"{shortcut['decision']} at {shortcut['site']} -- "
+        f"{shortcut['optimization']}. Reason: {shortcut['reason']}. Measured "
+        f"cost of not taking it: {shortcut['ns_per_iteration'] / 1000:.1f} us per "
+        f"`nested_containers` iteration "
+        f"({shortcut['skipped_constructions_per_iteration']} skipped "
+        f"`List(*args)` constructions at "
+        f"{shortcut['ns_per_skipped_construction'] / 1000:.2f} us each, by "
+        f"{shortcut['method_per_construction']}), and "
+        f"{shortcut['region_delta_ms']:.2f} ms on the "
+        f"{shortcut['region_iterations']}-iteration region -- "
+        f"{shortcut['region_ms_with_shortcut']:.2f} ms with it against "
+        f"{shortcut['region_ms_without_shortcut']:.2f} ms without it, the frozen "
+        f"arm measuring {shortcut['region_ms_baseline_arm']:.2f} ms, by "
+        f"{shortcut['method_region']}. Paired ratio "
+        f"{shortcut['ratio_with_shortcut']:.4f} with it "
+        f"({shortcut['ratio_with_shortcut_source']}) against "
+        f"{shortcut['ratio_without_shortcut_field']}, by "
+        f"{shortcut['method_ratio']}. Consequence: {shortcut['consequence']}. "
+        f"Why it was not recovered elsewhere: {shortcut['recovery_search']}, by "
+        f"{shortcut['method_recovery_search']}. Closing it needs: "
+        f"{shortcut['closure']}.",
     ]
     for note in env["notes"]:
         lines.append(f"- Note: {note}")
@@ -3695,6 +4271,30 @@ def _format_ratio_or_none(value: object) -> str:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return f"{float(value):.3f}"
     return "n/a"
+
+
+def _format_count_or_unknown(value: object) -> str:
+    """Render a commit count, or say it is unknown rather than guess one.
+
+    Args:
+        value: The JSON value to render, of any type.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"{value} commits"
+    return "an unknown number of commits"
+
+
+def _format_commit_list(value: object) -> str:
+    """Render a list of short SHAs, distinguishing empty from unreadable.
+
+    Args:
+        value: The JSON value to render, of any type.
+    """
+    if not isinstance(value, (list, tuple)):
+        return "unknown"
+    if not value:
+        return "none"
+    return ", ".join(str(entry) for entry in value)
 
 
 def _numeric(value: object) -> float | None:

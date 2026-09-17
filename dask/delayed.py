@@ -482,28 +482,10 @@ def unpack_collections(expr, _return_collections=True):
         # element of every container the traversal reaches.
         append_arg = args.append
         extend_collections = collections.extend
-        # ``verbatim`` stays true while every element comes back from the
-        # recursion as the object that went in and is itself no node, which is
-        # the condition under which the ``List`` built below carries no
-        # ``dependencies``: they can only come from a ``TaskRef`` or a
-        # ``GraphNode`` among its arguments. The branch then returns ``expr``
-        # itself, so the pair is the same whether or not the node was built
-        # first. ``len(args) != 1`` is what keeps that reasoning sound: a lone
-        # argument is the one case ``NestedContainer.__init__`` unwraps when it
-        # is a ``list`` instance, and unwrapping scans the *contents* of an
-        # element the exact-type dispatch left atomic - a ``list`` subclass
-        # holding a ``TaskRef`` does carry a dependency that way. Every
-        # container with a single element therefore still goes through
-        # ``List(*args)``, and so does every container that reaches a node.
-        verbatim = True
         for e in expr:
             arg, subcollections = unpack_collections(e, _return_collections=False)
-            if arg is not e or isinstance(e, (TaskRef, GraphNode)):
-                verbatim = False
             append_arg(arg)
             extend_collections(subcollections)
-        if verbatim and not collections and len(args) != 1:
-            return expr, ()
         if len(collections) > 1:
             # De-duplicate by identity, first occurrence winning and the order
             # being that of first appearance - exactly ``unique(..., key=id)``.
@@ -516,6 +498,10 @@ def unpack_collections(expr, _return_collections=True):
         # Every branch hands back a tuple of collections, including the
         # short-circuits below, so that callers can concatenate them.
         collections = tuple(collections)
+        # Built for every container, including one whose elements all came back
+        # from the recursion unchanged: ``NestedContainer.__init__`` unwraps a
+        # lone ``list`` argument, and only that unwrapping surfaces a ``TaskRef``
+        # held by a ``list`` subclass the exact-type dispatch left atomic.
         # The List constructor also checks for futures
         args = List(*args)
         if not collections and not args.dependencies:

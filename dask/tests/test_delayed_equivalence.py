@@ -85,11 +85,15 @@ from dask.utils_test import inc
 # the very same ``sys.modules["benchmarks.delayed_ab.canon"]`` entry and the two
 # bodies of evidence cannot drift apart. The static absolute import is unavailable
 # because ``benchmarks/`` is a namespace package, under which mypy maps ``canon.py``
-# under a second module name and rejects the build.
+# under a second module name and rejects the build. Attribute access on a module
+# object is typed ``Any``, so each alias below is annotated with the signature
+# ``canon.py`` declares for it and every call in this module is checked against it.
 _canon = importlib.import_module("benchmarks.delayed_ab.canon")
-canonical_graph = _canon.canonical_graph
-canonical_result = _canon.canonical_result
-normalize_key = _canon.normalize_key
+canonical_graph: Callable[[object], dict[str, Any]] = _canon.canonical_graph
+canonical_result: Callable[[Sequence[object]], tuple[Any, ...]] = (
+    _canon.canonical_result
+)
+normalize_key: Callable[[object, dict[str, str]], object] = _canon.normalize_key
 
 # Configuration pinned for every test *and* for ``write_golden()``, defined once
 # so the capture and the assertions cannot drift:
@@ -416,6 +420,10 @@ class _IdentityYieldingTuple(tuple):
 
     def __iter__(self) -> Iterator[Any]:
         return iter([f"id-{id(self)}"])
+
+
+class _ListSubclass(list):
+    """A ``list`` subclass, for the single-list unwrapping boundary test."""
 
 
 class _RaisingReprKey:
@@ -4968,6 +4976,71 @@ def test_sequence_without_a_collection_detects_dependent_nodes() -> None:
     assert collections == ()
 
 
+def test_single_element_container_unwraps_a_list_subclass_element() -> None:
+    """A lone ``list``-subclass element is unwrapped by the container node itself.
+
+    ``NestedContainer.__init__`` (``dask/_task_spec.py:851-853``) replaces its
+    arguments with the single argument it was given whenever that argument is a
+    ``list`` instance, and the test is an ``isinstance`` one, so a ``list``
+    *subclass* is unwrapped too. The exact-type dispatch of
+    ``unpack_collections`` leaves such a subclass atomic, so a ``TaskRef`` inside
+    it is invisible to the traversal and becomes a dependency only because the
+    node was built: the container branch has to keep constructing ``List(*args)``
+    and read the verdict off the node, instead of concluding from the recursion's
+    own verdicts that the container can be handed back unchanged.
+
+    The boundary is the argument count. With one argument the element's contents
+    are hoisted and the dependency appears; with two there is no unwrapping, the
+    subclass stays an opaque element, the ``List`` carries no dependency and the
+    branch short-circuits to the input object. Both sides are asserted here,
+    along with the two shapes that could be mistaken for them: a plain inner
+    ``list``, which takes the sequence branch itself so that the outer lone
+    argument is a ``List`` node and nothing is unwrapped, and the subclass at
+    top level, which takes the fallthrough and is returned as itself.
+    """
+    single_element = [_ListSubclass([TaskRef("k")])]
+    task, collections = unpack_collections(single_element)
+    assert type(task).__name__ == "List"
+    assert task.dependencies == {"k"}
+    # The lone element was unwrapped, so its ``TaskRef`` is a direct argument of
+    # the node -- the only way the dependency can be derived at all.
+    assert task.args == (TaskRef("k"),)
+    assert collections == ()
+    assert task is not single_element
+
+    # Two arguments: no unwrapping, hence no dependency, and the branch's own
+    # short-circuit hands back the input list object.
+    two_elements = [_ListSubclass([TaskRef("k")]), 1]
+    task, collections = unpack_collections(two_elements)
+    assert task is two_elements
+    assert collections == ()
+
+    # A plain inner ``list`` is not an opaque element: it takes the sequence
+    # branch, so the outer container's lone argument is already a ``List`` node
+    # and ``isinstance(args[0], list)`` is false -- nothing is unwrapped, and the
+    # dependency comes from the nested node.
+    task, collections = unpack_collections([[TaskRef("k")]])
+    assert type(task).__name__ == "List"
+    assert task.dependencies == {"k"}
+    assert len(task.args) == 1
+    assert type(task.args[0]).__name__ == "List"
+    assert collections == ()
+
+    # The same subclass at top level: exact-type membership excludes it from the
+    # container branch entirely.
+    top_level = _ListSubclass([TaskRef("k")])
+    task, collections = unpack_collections(top_level)
+    assert task is top_level
+    assert collections == ()
+
+    # Unwrapping a subclass that holds no node contributes nothing, so the
+    # constructed ``List`` is discarded in favour of the input object.
+    without_a_node = [_ListSubclass([1, 2])]
+    task, collections = unpack_collections(without_a_node)
+    assert task is without_a_node
+    assert collections == ()
+
+
 def test_traversed_container_wrap_rewrites_the_container_node_key() -> None:
     """``delayed([a])`` keys the container node after the wrapper itself.
 
@@ -5568,3 +5641,127 @@ def test_objects_and_graphs_round_trip_through_pickle() -> None:
         if entry.canonical:
             assert canonical_graph(restored) == GOLDEN[entry.name]["graph"], entry.name
         _assert_round_tripped_result(entry, obj, restored)
+
+
+# Longest chain of lazy attribute accesses whose ancestors the construction path
+# still inspects before merging a dependency's graph; the 65th link sends the
+# whole call to ``HighLevelGraph.from_collections`` (``dask/delayed.py:290``).
+# Mirrored here rather than imported, because the bound is a property of the
+# production path that these tests pin from the outside.
+_ANCESTOR_BOUND = 64
+
+
+class _SelfAttribute:
+    """A value whose ``a`` attribute is the value itself.
+
+    It makes an attribute chain of any length runnable: every ``getattr(x, "a")``
+    task in the graph hands back the same object, so a chain past
+    ``_ANCESTOR_BOUND`` links computes to that object instead of failing on a
+    missing attribute.
+    """
+
+    @property
+    def a(self) -> _SelfAttribute:
+        """The value itself, so ``delayed_value.a.a.a`` stays computable."""
+        return self
+
+
+def _attribute_chain(links: int, value: Any) -> Delayed:
+    """Stack ``links`` lazy attribute accesses over a wrapped value.
+
+    Args:
+        links: Number of ``DelayedAttr`` links to place above the root node.
+        value: The value the root node holds.
+
+    Returns:
+        Delayed: The topmost link of the chain, or the root itself for zero
+        links. The root carries a plain ``dict`` graph and a ``str`` key and
+        layer name, so nothing but the chain's length can decide how the
+        construction path treats it.
+
+    """
+    chain: Delayed = Delayed(
+        "chain-root", {"chain-root": DataNode("chain-root", value)}
+    )
+    for _ in range(links):
+        chain = chain.a
+    return chain
+
+
+def test_a_cyclic_attribute_chain_is_bounded_rather_than_walked_forever() -> None:
+    """A cyclic ``DelayedAttr`` chain leaves the merge shortcut, never loops.
+
+    ``_obj`` is a declared slot, so ``Delayed.__setattr__`` lets a caller assign
+    it -- the asymmetry ``test_nominal_immutability_asymmetry_is_preserved``
+    pins -- and build a chain that never reaches a root. The construction path
+    inspects a dependency's ancestors before it merges the dependency's graph, so
+    an unbounded inspection would spin here until the 300 s timeout. Bounded at
+    ``_ANCESTOR_BOUND`` ancestors, it hands the cycle to the generic
+    ``HighLevelGraph.from_collections`` instead, which resolves a cycle by
+    recursion and so raises ``RecursionError``.
+
+    That is the pre-refactor outcome too: the same construction against the
+    frozen baseline arm (``benchmarks/delayed_ab/baseline_delayed.py`` installed
+    as ``sys.modules["dask.delayed"]``), where the generic path is the only path,
+    raises ``RecursionError`` as well. The raised exception is itself the evidence
+    that the inspection terminated -- an unbounded walk never returns to raise
+    anything.
+    """
+    root = Delayed("cyclic-root", {"cyclic-root": DataNode("cyclic-root", 1)})
+    cyclic = root.a
+    assert type(cyclic) is DelayedAttr
+    cyclic._obj = cyclic
+    assert cyclic._obj is cyclic
+
+    with pytest.raises(RecursionError):
+        delayed(ident, name="ident")(cyclic)
+
+    # Nothing leaks from the failed construction: the tokenizer releases its lock
+    # and its cycle registry on the way out, so the next construction in the same
+    # process behaves exactly as it would have without the cycle.
+    assert canonical_result([delayed(ident, name="ident")(1, 2)]) == ((1, 2),)
+
+
+def test_chain_at_and_past_the_ancestor_bound_matches_the_generic_path() -> None:
+    """Either side of the ancestor bound builds the generic path's graph.
+
+    A chain of ``_ANCESTOR_BOUND`` links is merged directly; one link more sends
+    the whole call to ``HighLevelGraph.from_collections``. The two have to be
+    indistinguishable from the outside, so each is compared against
+    ``from_collections`` given the same name, layer and dependency: the ordered
+    ``layers``, the ordered ``dependencies``, every layer's dependency set and
+    every layer's contents, plus the value the graph computes to.
+
+    An arm-to-arm comparison is unavailable at this depth and always will be,
+    which is a property of the pre-refactor code rather than a gap here: the
+    generic path builds a dependency's graph twice per level, so an attribute
+    chain costs 2**links graph builds there -- measured on the frozen baseline
+    arm at 8.2 s for 18 links and over 45 s for 22. The same shape at 0 to 3
+    links is what ``attr_v``/``attr_of_attr`` compare against the golden, and
+    ``test_attribute_chain_over_an_unsafe_ancestor_reprs_its_key_as_today`` pins
+    the side-effect counts those levels perform.
+    """
+    for links in (_ANCESTOR_BOUND, _ANCESTOR_BOUND + 1):
+        value = _SelfAttribute()
+        chain = _attribute_chain(links, value)
+        node = delayed(ident, name="ident")(chain)
+
+        graph = node.__dask_graph__()
+        assert isinstance(graph, HighLevelGraph)
+        # The new node's layer, one layer per link, and the root's.
+        assert len(graph.layers) == links + 2
+
+        generic = HighLevelGraph.from_collections(
+            node.key, dict(graph.layers[node.key]), dependencies=[chain]
+        )
+        assert list(generic.layers) == list(graph.layers), f"{links} links"
+        assert list(generic.dependencies) == list(graph.dependencies), f"{links} links"
+        for layer_name in graph.layers:
+            assert set(generic.dependencies[layer_name]) == set(
+                graph.dependencies[layer_name]
+            ), f"{links} links, layer {layer_name}"
+            assert dict(generic.layers[layer_name]) == dict(
+                graph.layers[layer_name]
+            ), f"{links} links, layer {layer_name}"
+
+        assert canonical_result([node]) == ((value,),)
