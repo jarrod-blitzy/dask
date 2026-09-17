@@ -45,6 +45,20 @@ Artefacts:
     and ``max_observed_blocks`` are supporting evidence that is never called a
     peak.
 
+Reading a verdict:
+    The committed verdict is the default round count's, taken on an otherwise
+    idle host. A reduced-round run -- the opt-in gate test's ``--rounds 7
+    --warmup 2``, the protocol's floor -- trades interval precision for a runtime
+    that fits inside a test, and the ``nested_containers`` paired ratio clears its
+    threshold by a few percent, which is inside the run-to-run spread of a shared
+    machine at that round count. A reduced-round run has been observed on either
+    side of that item, as has the free-threaded build, while behaviour and the
+    equivalence assertions held in every one of those runs. The runner prints a
+    notice whenever it measures fewer rounds than the committed configuration,
+    and ``environment.nested_containers_margin`` in the JSON artefact carries the
+    observed spread, the reasoning and the reasons neither the round counts nor
+    the threshold may be moved to widen the margin.
+
 Exit codes of the run itself; ``argparse`` rejects a malformed command line
 before the run starts, with its conventional status 2:
     ``0`` -- every gate item held. ``1`` -- the gate failed; the printed checklist

@@ -54,15 +54,41 @@ Provenance of the golden block:
     instead of against one layer's nodes, which is where a ``DelayedAttr`` node's
     parent actually lives.
 
+    The ordering half of the §0.5.1 proof is therefore permanently unavailable
+    from this branch's history: the branch is published, rewriting it is
+    forbidden, and the block cannot be re-captured into a corrected history. What
+    is accepted in its place -- knowingly, as the resolution of that failure, and
+    not as a claim this docstring makes -- is a re-derivation this module asserts
+    on every run, in two tests::
+
+        test_the_golden_re_derives_from_the_frozen_baseline_arm
+        test_the_arm_dependent_entries_are_the_only_verbatim_exceptions
+
+    The first rebuilds all 90 committed entries with the frozen baseline arm
+    (``benchmarks/delayed_ab/baseline_delayed.py``: ``dask/delayed.py`` at the
+    base commit, one commit in its git history, made before the first production
+    edit) and compares every field of every entry against the block. The second
+    restores the character-for-character comparison wherever the environment
+    reproduces the capture: 88 of the 90 agree byte for byte, and the 2 that
+    cannot -- ``arg_list_iterator_with_delayed`` and ``op_reflected_add`` --
+    differ in nothing but their own key token, which embeds the arm's module path
+    for the pickle-by-reference reason AAP §0.4.1 documents as inherently
+    arm-dependent. That pair is what makes the substitution durable rather than
+    historical: a golden carrying a value the pre-refactor module does not produce
+    fails them, which is the whole of what the ordering requirement was there to
+    prevent. The block is never regenerated again.
+
     The values are therefore a pre-refactor capture that was re-serialised, not a
     re-measurement of refactored behaviour, and that is checkable rather than
-    asserted. Three re-verifications, each reproducible from this tree. The first
-    two need a base-commit worktree, built from the repository root as::
+    asserted. Three further re-verifications were run by hand, each reproducible
+    from this tree. The first two need a base-commit worktree, built from the
+    repository root as::
 
         git worktree add <scratch>/base_wt c9d1df34ccba182ddf43c2dbe4315c4d9c8c44e1
         mkdir -p <scratch>/base_wt/benchmarks/delayed_ab
         cp dask/_version.py <scratch>/base_wt/dask/_version.py
         cp benchmarks/delayed_ab/__init__.py benchmarks/delayed_ab/canon.py <scratch>/base_wt/benchmarks/delayed_ab/
+        cp benchmarks/delayed_ab/baseline_delayed.py <scratch>/base_wt/benchmarks/delayed_ab/
         cp dask/tests/test_delayed_equivalence.py <scratch>/base_wt/dask/tests/
 
     1. Re-capture against the pre-refactor module, from inside that worktree::
@@ -76,7 +102,7 @@ Provenance of the golden block:
 
            DASK_DELAYED_BASELINE_ORACLE=1 python -m pytest dask/tests/test_delayed_equivalence.py
 
-       It passes -- 158 passed, 1 skipped, the skip being the gated test below.
+       It passes -- 160 passed, 1 skipped, the skip being the gated test below.
        Every exact key and every raw canonical graph in the block is therefore
        reproduced *by the baseline module*, which is the property the git history
        was supposed to show.
@@ -140,12 +166,16 @@ Notes:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
+import json
 import operator
 import os
 import pickle
 import pprint
+import subprocess
 import sys
+import traceback
 import types
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -4516,6 +4546,438 @@ def write_golden() -> None:
     ]
     path.write_text("".join(lines[:begin] + block + lines[end + 1 :]))
     print(f"captured {len(golden)} golden entries into {path}")
+
+
+# ---------------------------------------------------------------------------
+# Provenance of the golden fixture, re-derived rather than read out of git.
+#
+# AAP §0.5.1 asks two things of the block above: that its values came from the
+# pre-refactor module, and that the capture happened before the first edit to
+# ``dask/delayed.py``. The second was to be read off this file's git history, and
+# on this branch it cannot be -- the block was re-emitted after that edit, the
+# branch is published, and rewriting its history is forbidden. What that
+# re-emission did and did not change is set out in the module docstring under
+# "Provenance of the golden block"; what stands in place of the missing history
+# read is here, and it is re-run by every suite run rather than inspected once.
+#
+# The frozen baseline arm -- ``dask/delayed.py`` as it stood at the base commit,
+# copied into ``benchmarks/delayed_ab/baseline_delayed.py`` in a single commit
+# made before the first production edit -- rebuilds the whole corpus, and every
+# committed golden value is compared against what that module produces. A golden
+# regenerated from the refactored module would disagree, which is the guarantee
+# the ordering requirement existed to give.
+# ---------------------------------------------------------------------------
+
+#: Repository root: ``dask/tests/`` sits two directories below it. The
+#: re-derivation subprocess runs there because ``benchmarks`` is a PEP 420
+#: namespace package, importable from the root and nowhere else.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Arm A of the A/B performance suite, used here as the pre-refactor oracle.
+_BASELINE_ARM_MODULE = "benchmarks.delayed_ab.baseline_delayed"
+_BASELINE_ARM_PATH = _REPO_ROOT / "benchmarks" / "delayed_ab" / "baseline_delayed.py"
+
+#: The base commit the arm was captured from, and the ``sha256`` of
+#: ``dask/delayed.py`` there. Recorded here independently of the arm's own header
+#: comment, so that an edited oracle fails this module rather than lending its
+#: credibility to the re-derivation below. Re-derive it from the repository root
+#: with ``git show c9d1df34ccba182ddf43c2dbe4315c4d9c8c44e1:dask/delayed.py |
+#: sha256sum``.
+_BASE_COMMIT = "c9d1df34ccba182ddf43c2dbe4315c4d9c8c44e1"
+_BASELINE_ARM_BODY_SHA256 = (
+    "4c0000e204ea5b701cbef0879f6af74e3b547249edede4a1003ef4d78493d6f1"
+)
+
+#: The two golden entries the frozen arm cannot reproduce character for
+#: character, each with the construct that makes it arm-dependent. Both are the
+#: pickle-by-reference case AAP §0.4.1 documents: a token computed by pickling
+#: something by reference embeds the defining module's name, which is
+#: ``benchmarks.delayed_ab.baseline_delayed`` on one arm and ``dask.delayed`` on
+#: the other, so the two arms necessarily produce different deterministic tokens
+#: from identical code. The difference is one token wide -- their own key's -- and
+#: that it is no wider is asserted rather than assumed
+#: (``test_the_golden_re_derives_from_the_frozen_baseline_arm`` compares them with
+#: that one token set aside and finds no other difference, including in the value
+#: each expression computes to).
+_ARM_DEPENDENT_GOLDEN_ENTRIES: dict[str, str] = {
+    "arg_list_iterator_with_delayed": (
+        "call_function tokenizes the raw iterator before unpack_collections coerces "
+        "it, so tokenize pickles the underlying list -- including the Delayed it "
+        "holds, whose class pickles by reference to the module that defined it"
+    ),
+    "op_reflected_add": (
+        "a reflected operator tokenizes right(op) -- partial(_swap, op) -- and a "
+        "module-level function pickles by reference as <module>._swap, so the key "
+        "token embeds the arm's own module path while the _swap prefix does not"
+    ),
+}
+
+#: What an arm-dependent key token is replaced by while the two arms are
+#: compared. It holds characters no generated key can, so a masked form can never
+#: be mistaken for a real one, and it is distinct from ``_ENV_TOKEN_PLACEHOLDER``
+#: and from ``_stable_graph``'s ``<hexN>`` so that the three relaxations stay
+#: distinguishable in a failure message.
+_ARM_TOKEN_PLACEHOLDER = "<arm-token>"
+
+#: Whether this environment reproduces both kinds of token the capture
+#: environment decided, and therefore whether the verbatim half of the
+#: re-derivation can be asserted here at all.
+_CAPTURE_ENVIRONMENT_REPRODUCES: bool = (
+    _HASHER_REPRODUCES_CAPTURE and _INTERPRETER_REPRODUCES_CAPTURE
+)
+
+#: Skip reason for the verbatim half, naming the causes this environment does not
+#: reproduce. Read on its own in a ``-rs`` summary, like every other skip here.
+_NON_CAPTURE_ENVIRONMENT_REASON = (
+    "the character-for-character half of the baseline-arm re-derivation needs the "
+    "environment the golden was captured in, because twelve entries carry a key "
+    "token the environment rather than the module decides: "
+    + "; ".join(
+        cause.reason for cause in _TOKEN_CAUSES.values() if not cause.reproduces_capture
+    )
+)
+
+#: How long the re-derivation subprocess may take. It builds ninety small
+#: expressions in a fresh interpreter -- under a second in the environment of
+#: record -- so this is a fail-fast bound rather than a budget, and it stays well
+#: inside the project's 300 s per-test limit.
+_REDERIVATION_TIMEOUT = 120
+
+#: The program the subprocess runs. The arm has to be installed as
+#: ``sys.modules["dask.delayed"]`` -- AAP §0.4.1's arm activation -- *before* this
+#: module is imported, because the ``from dask.delayed import ...`` at the top of
+#: this file is what binds the classes under test; hence a fresh interpreter
+#: rather than a context manager. This module is imported under its own canonical
+#: name so that its corpus callables still pickle by reference to the very paths
+#: the capture saw, exactly as ``write_golden()`` requires of the capture.
+_REDERIVATION_BOOTSTRAP = (
+    "import importlib, sys; "
+    f"sys.modules['dask.delayed'] = importlib.import_module({_BASELINE_ARM_MODULE!r}); "
+    f"importlib.import_module({__name__!r})._emit_golden_rederivation()"
+)
+
+
+def _baseline_arm_body_sha256() -> str:
+    """Return the ``sha256`` of the frozen arm's captured body.
+
+    The arm is ``dask/delayed.py`` at ``_BASE_COMMIT`` with a leading comment
+    header prepended, so the digest is taken over the text from the first line
+    that is neither blank nor a comment -- the file's own ``from __future__ import
+    annotations`` -- to the end, which is the captured source and nothing else.
+
+    Returns:
+        str: the hex digest, comparable with ``_BASELINE_ARM_BODY_SHA256``.
+
+    """
+    lines = _BASELINE_ARM_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
+    start = 0
+    while start < len(lines) and (
+        not lines[start].strip() or lines[start].startswith("#")
+    ):
+        start += 1
+    body = "".join(lines[start:])
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _rederivation_masker(name: str, key: object) -> Callable[[Any], Any]:
+    """Return the transform that makes one entry comparable across the two arms.
+
+    ``_token_masker`` sets aside the key token of the twelve entries whose token
+    the *environment* decides. This sets aside those and, in addition, the key
+    token of the two entries whose token the *arm* decides
+    (``_ARM_DEPENDENT_GOLDEN_ENTRIES``). For every other entry it is
+    ``_token_masker``'s verdict, which is the identity, so their keys, graphs and
+    results stay under verbatim comparison.
+
+    Args:
+        name: Corpus entry name, looked up in both registries.
+        key: The key whose token is to be set aside -- the golden key for a golden
+            form, the re-derived key for a re-derived one.
+
+    Returns:
+        Callable: a transform over a canonical form (a ``dict``, a ``list`` or a
+        bare key), returning the same structure with nothing but that one token
+        replaced.
+
+    """
+    if name not in _ARM_DEPENDENT_GOLDEN_ENTRIES:
+        return _token_masker(name, key)
+
+    replacements = {_hex_key_token(name, key): _ARM_TOKEN_PLACEHOLDER}
+
+    def mask(form: Any) -> Any:
+        return _substitute(form, replacements)
+
+    return mask
+
+
+def _rederive_golden() -> dict[str, Any]:
+    """Rebuild every corpus entry with whatever module ``dask.delayed`` now names.
+
+    Run in the subprocess of ``_REDERIVATION_BOOTSTRAP``, that module is the
+    frozen baseline arm, so this rebuilds the corpus on the pre-refactor
+    construction path -- under the same hasher and configuration pins the capture
+    and every test here use -- and compares each entry against the committed
+    golden twice: verbatim, and with the key tokens ``_rederivation_masker`` sets
+    aside.
+
+    The comparison happens here rather than in the parent so that no graph has to
+    travel: a canonical graph is JSON-expressible, but a round trip through JSON
+    would turn its tuples into lists and compare something weaker than what was
+    captured. Only names, field names and keys go into the payload.
+
+    An entry that raises is recorded with its traceback instead of aborting the
+    run, because a payload naming the one broken entry is worth more to whoever
+    reads the failure than a subprocess that died on it.
+
+    Returns:
+        dict: ``delayed_module`` (the ``__module__`` of the ``Delayed`` this
+        module bound, which is how the parent tells an activated arm from an
+        unactivated one), ``arm_file``, ``ambient_hasher``, ``corpus`` and
+        ``golden`` (the two name lists, so a partial run cannot pass as a
+        complete one), ``raw`` and ``masked`` (each ``{"identical": [names],
+        "differing": {name: {"fields", "golden_key", "derived_key"}}}``), and
+        ``errors``.
+
+    """
+    raw: dict[str, Any] = {"identical": [], "differing": {}}
+    masked: dict[str, Any] = {"identical": [], "differing": {}}
+    errors: dict[str, str] = {}
+    with _pinned():
+        for entry in CORPUS:
+            golden = GOLDEN[entry.name]
+            try:
+                derived = _golden_entry(entry)
+                mask_derived = _rederivation_masker(entry.name, derived["key"])
+                mask_golden = _rederivation_masker(entry.name, golden["key"])
+                comparisons = (
+                    (
+                        raw,
+                        sorted(
+                            field for field in golden if derived[field] != golden[field]
+                        ),
+                    ),
+                    (
+                        masked,
+                        sorted(
+                            field
+                            for field in golden
+                            if mask_derived(derived[field])
+                            != mask_golden(golden[field])
+                        ),
+                    ),
+                )
+            except Exception:
+                errors[entry.name] = traceback.format_exc(limit=6)
+                continue
+            for group, fields in comparisons:
+                if fields:
+                    group["differing"][entry.name] = {
+                        "fields": fields,
+                        "golden_key": golden["key"],
+                        "derived_key": derived["key"],
+                    }
+                else:
+                    group["identical"].append(entry.name)
+    arm = sys.modules.get(_BASELINE_ARM_MODULE)
+    return {
+        "delayed_module": Delayed.__module__,
+        "arm_file": None if arm is None else arm.__file__,
+        "ambient_hasher": _AMBIENT_HASHER,
+        "corpus": [entry.name for entry in CORPUS],
+        "golden": sorted(GOLDEN),
+        "raw": raw,
+        "masked": masked,
+        "errors": errors,
+    }
+
+
+def _emit_golden_rederivation() -> None:
+    """Print the re-derivation payload as JSON on stdout.
+
+    Entry point of the subprocess ``_REDERIVATION_BOOTSTRAP`` starts. Stdout
+    carries the payload and nothing else, so the parent can parse it whatever the
+    interpreter writes to stderr.
+    """
+    json.dump(_rederive_golden(), sys.stdout)
+
+
+@pytest.fixture(scope="module")
+def _golden_rederivation() -> dict[str, Any]:
+    """Re-derive the golden fixture from the frozen baseline arm, once per module.
+
+    Returns:
+        dict: the payload ``_rederive_golden`` built in the subprocess, parsed
+        from its stdout and shared by the two tests below.
+
+    Raises:
+        AssertionError: if the arm is missing, if the subprocess fails, or if it
+            prints something other than the payload -- with the command, the
+            working directory and both streams in the message. A re-derivation
+            that cannot run leaves the golden unproven, which is not a pass.
+
+    """
+    assert _BASELINE_ARM_PATH.is_file(), (
+        f"the frozen baseline arm {_BASELINE_ARM_PATH} is missing, so the golden's "
+        "provenance cannot be re-derived. It is a committed deliverable of this work "
+        "(AAP §0.4.1); if this module was copied into another tree, copy the arm with "
+        "it -- see the module docstring"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", _REDERIVATION_BOOTSTRAP],
+        capture_output=True,
+        check=False,
+        cwd=_REPO_ROOT,
+        text=True,
+        timeout=_REDERIVATION_TIMEOUT,
+    )
+    context = (
+        f"command: {sys.executable} -c {_REDERIVATION_BOOTSTRAP}\n"
+        f"cwd: {_REPO_ROOT}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+    assert (
+        completed.returncode == 0
+    ), f"the baseline-arm re-derivation exited {completed.returncode}\n{context}"
+    try:
+        payload: dict[str, Any] = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise AssertionError(
+            f"the baseline-arm re-derivation printed no parsable payload: {error}\n"
+            f"{context}"
+        ) from error
+    return payload
+
+
+def test_the_golden_re_derives_from_the_frozen_baseline_arm(
+    _golden_rederivation: dict[str, Any],
+) -> None:
+    """Every committed golden value is one the pre-refactor module produces.
+
+    This is the standing substitute for the half of AAP §0.5.1 that this branch's
+    git history cannot show -- that the block was captured before the first edit
+    to ``dask/delayed.py`` -- and it is the assertion the substitution rests on
+    rather than a claim about it. The oracle is checked first, because a
+    re-derivation is evidence only if the module that produced it is the
+    pre-refactor one: the arm's captured body must still hash to
+    ``dask/delayed.py`` at ``_BASE_COMMIT``, and the subprocess must really have
+    bound the arm's classes rather than the live module's.
+
+    All ninety entries then agree field for field -- key, canonical graph, stable
+    graph and computed result -- with only the two arm-dependent key tokens of
+    ``_ARM_DEPENDENT_GOLDEN_ENTRIES`` set aside. That comparison is portable: the
+    twelve environment-dependent tokens are set aside here too, so the property
+    holds on any interpreter and under any installed hash library. Wherever the
+    environment reproduces the capture, the character-for-character comparison is
+    restored by the test below::
+
+        test_the_arm_dependent_entries_are_the_only_verbatim_exceptions
+
+    which also pins that those two tokens are the only relaxation the arms need.
+
+    Args:
+        _golden_rederivation: The payload of the re-derivation subprocess.
+
+    """
+    payload = _golden_rederivation
+    assert _baseline_arm_body_sha256() == _BASELINE_ARM_BODY_SHA256, (
+        f"{_BASELINE_ARM_PATH} is no longer the capture of dask/delayed.py at "
+        f"{_BASE_COMMIT}, so it cannot serve as the pre-refactor oracle"
+    )
+    assert payload["delayed_module"] == _BASELINE_ARM_MODULE, (
+        "the re-derivation ran against "
+        f"{payload['delayed_module']!r} rather than the frozen arm, so it says "
+        "nothing about pre-refactor behaviour"
+    )
+    assert payload["arm_file"] == str(
+        _BASELINE_ARM_PATH
+    ), f"the arm imported was {payload['arm_file']!r}, not {_BASELINE_ARM_PATH}"
+    assert payload["ambient_hasher"] == _AMBIENT_HASHER, (
+        f"the subprocess selected {payload['ambient_hasher']!r} where this process "
+        f"selected {_AMBIENT_HASHER!r}, so the two are not the same environment"
+    )
+    assert payload["errors"] == {}, (
+        f"the frozen arm could not rebuild {sorted(payload['errors'])}: "
+        f"{payload['errors']}"
+    )
+    assert payload["corpus"] == [entry.name for entry in CORPUS]
+    assert payload["golden"] == sorted(GOLDEN)
+
+    for name, reason in sorted(_ARM_DEPENDENT_GOLDEN_ENTRIES.items()):
+        # A registry entry has to name a real, deterministically keyed corpus
+        # entry whose golden key the masker can split -- otherwise the relaxation
+        # it grants would be granted to nothing, or to a token that is not one.
+        assert _by_name(name).deterministic, f"{name}: only a deterministic key token"
+        assert _hex_key_token(name, GOLDEN[name]["key"])
+        assert reason, f"{name}: an arm-dependent entry needs its cause recorded"
+
+    assert payload["masked"]["differing"] == {}, (
+        "the frozen pre-refactor arm does not reproduce "
+        f"{sorted(payload['masked']['differing'])}, so those golden values are not a "
+        "pre-refactor capture. The golden is never regenerated to make this pass -- "
+        "see the module docstring, 'Provenance of the golden block'"
+    )
+    assert sorted(payload["masked"]["identical"]) == sorted(GOLDEN)
+
+
+@pytest.mark.skipif(
+    not _CAPTURE_ENVIRONMENT_REPRODUCES, reason=_NON_CAPTURE_ENVIRONMENT_REASON
+)
+def test_the_arm_dependent_entries_are_the_only_verbatim_exceptions(
+    _golden_rederivation: dict[str, Any],
+) -> None:
+    """Character for character, the frozen arm reproduces all but two entries.
+
+    The portable comparison above sets aside fourteen key tokens: twelve the
+    environment decides and two the arm does. In the environment the golden was
+    captured in, the first twelve need no relaxation at all, so this restores the
+    verbatim comparison and pins the exact figure the acknowledgement of the
+    §0.5.1 ordering failure rests on: eighty-eight of the ninety committed entries
+    re-derive byte for byte from the pre-refactor module, and the two that cannot
+    are the ones ``_ARM_DEPENDENT_GOLDEN_ENTRIES`` names.
+
+    It also pins how narrowly they may differ, which is what keeps the registry
+    from becoming a licence: the difference has to be in the key, it may reach no
+    field but the graph serializations that embed that key, it may never reach the
+    computed result, and both sides must still be deterministic 32-hex digests
+    under one shared prefix -- a UUID fallback or a changed prefix fails here.
+
+    Args:
+        _golden_rederivation: The payload of the re-derivation subprocess.
+
+    """
+    payload = _golden_rederivation
+    differing = payload["raw"]["differing"]
+    assert sorted(differing) == sorted(_ARM_DEPENDENT_GOLDEN_ENTRIES), (
+        "the entries the frozen arm cannot reproduce verbatim have changed: "
+        f"expected {sorted(_ARM_DEPENDENT_GOLDEN_ENTRIES)}, got {sorted(differing)}"
+    )
+    assert len(payload["raw"]["identical"]) == len(GOLDEN) - len(
+        _ARM_DEPENDENT_GOLDEN_ENTRIES
+    )
+
+    for name, record in sorted(differing.items()):
+        fields = record["fields"]
+        golden_key = record["golden_key"]
+        derived_key = record["derived_key"]
+        assert (
+            "key" in fields
+        ), f"{name}: differs somewhere other than its key: {fields}"
+        assert "result_repr" not in fields, (
+            f"{name}: the value the expression computes to differs between the arms, "
+            "which no module path can explain"
+        )
+        assert set(fields) <= {"key", "graph", "stable_graph"}, (
+            f"{name}: the arm difference reaches {sorted(set(fields) - {'key', 'graph', 'stable_graph'})}, "
+            "beyond the key and the graph serializations that embed it"
+        )
+        assert golden_key.rpartition("-")[0] == derived_key.rpartition("-")[0], (
+            f"{name}: the key prefix changed, {golden_key!r} against {derived_key!r}; "
+            "only the token may differ between the arms"
+        )
+        assert _hex_key_token(name, golden_key) != _hex_key_token(name, derived_key), (
+            f"{name}: both arms produced the same token, so the entry is not "
+            "arm-dependent and does not belong in _ARM_DEPENDENT_GOLDEN_ENTRIES"
+        )
 
 
 @pytest.mark.parametrize("entry", CORPUS, ids=[entry.name for entry in CORPUS])

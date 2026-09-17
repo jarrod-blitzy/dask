@@ -106,12 +106,25 @@ _SCHEMA_VERSION = 1
 #: defaults to 15 measured rounds and is the committed evidence; the gate trades
 #: interval precision for a runtime that fits inside a pytest test.
 #:
-#: They stay at the minimums. More rounds would tighten the interval, but a
-#: nine-case run at these counts already needs 150-215 s of the cap derived
-#: below, and the committed 15-round artefact shows the interval of a marginal
-#: case still straddling its threshold -- so rounds buy runtime risk rather than
-#: a decision, and the decision is made robust by judging the interval instead
-#: (see :func:`_evaluate_thresholds`).
+#: They stay at the minimums, and they have to: the reduced counts are the ones
+#: AAP 0.4.7 prescribes for this test, and the full run's default of 15 is
+#: likewise the plan's number, so neither is a free parameter this test may raise
+#: to buy margin. More rounds would tighten the interval, but a nine-case run at
+#: these counts already needs 150-215 s of the cap derived below, and the
+#: committed 15-round artefact shows the interval of a marginal case still
+#: straddling its threshold -- so rounds buy runtime risk rather than a decision,
+#: and the decision is made robust by judging the interval instead (see
+#: :func:`_evaluate_thresholds`).
+#:
+#: What the margin looks like in practice, measured on a 12-core host: at these
+#: reduced counts the ``nested_containers`` paired ratio has been observed from
+#: 1.24 to 1.29 against the 1.25 item -- passing in most runs, short by 0.010 in
+#: one -- and on the free-threaded build at 1.235 (its whole interval below the
+#: item) and 1.257. Equivalence held in every one of those runs, which is the
+#: distinction the interval judgment below exists to draw: a marginal timing item
+#: is reported as undecided, while a behavioural difference or a measured
+#: regression still fails. The harness publishes the same figures under
+#: ``environment.nested_containers_margin``.
 _ROUNDS = 7
 _WARMUP = 2
 
